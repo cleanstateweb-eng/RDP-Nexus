@@ -1,0 +1,35 @@
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Build and distribution
+build/
+dist/
+*.spec
+
+# Test and scratch
+.pytest_cache/
+.scratch/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Built installers are published as GitHub Release assets, not committed
+release/
