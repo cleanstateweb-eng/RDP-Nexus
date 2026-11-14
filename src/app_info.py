@@ -6,7 +6,7 @@ import os
 import sys
 
 APP_NAME = "RDP Nexus"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 APP_PUBLISHER = "RDP Nexus"
 APP_URL = "https://github.com/cleanstateweb-eng/RDP-Nexus"
 # Explicit AppUserModelID so the taskbar groups the window under our own icon

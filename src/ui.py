@@ -83,6 +83,18 @@ DWMWA_BORDER_COLOR = 34
 DWMWCP_ROUND = 2
 
 
+def chevron_image(up: bool, color: str, size: int = 14) -> ctk.CTkImage:
+    """A crisp up/down chevron drawn at 4x and scaled down, so the show/hide-settings button always
+    has a visible icon whatever icon fonts this PC has."""
+    from PIL import ImageDraw
+    big = size * 4
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    y_tip, y_ends = (big * 0.32, big * 0.68) if up else (big * 0.68, big * 0.32)
+    ImageDraw.Draw(img).line([(big * 0.18, y_ends), (big * 0.5, y_tip), (big * 0.82, y_ends)], fill=color,
+                             width=max(2, big // 9), joint="curve")
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+
 def fmt_countdown(seconds: float | None) -> str:
     if seconds is None:
         return "--:--"
@@ -299,6 +311,8 @@ class NexusPanel(ctk.CTk):
         self.btn_close = self._icon_button(right, "close", self.quit_app, "Exit RDP Nexus")
         self.btn_tray = self._icon_button(right, "minimize", self.minimize, "Minimize")
         self.btn_expand = self._icon_button(right, "down", self.toggle_expanded, "Show settings")
+        self._chevrons = {True: chevron_image(True, C["text"]), False: chevron_image(False, C["text"])}
+        self._set_expand_icon(False)
         sep = ctk.CTkFrame(right, fg_color=C["border"], width=1, height=20)
         self.btn_ptr = self._icon_button(right, "mouse", self.toggle_pointer, "Gentle pointer movement on/off")
         self.btn_kb = self._icon_button(right, "keyboard", self.toggle_keyboard, "Keyboard navigation on/off")
@@ -337,6 +351,14 @@ class NexusPanel(ctk.CTk):
                                       scrollbar_button_hover_color=C["hover"])
         page.pack(fill="both", expand=True)
         self.__dict__.setdefault("tab_pages", {})[name] = page
+
+        def sync_scrollbar(_event=None):  # show the scrollbar only when the content is taller than the tab
+            needed = page.winfo_reqheight() > page._parent_canvas.winfo_height() + 1
+            if needed != bool(page._scrollbar.winfo_ismapped()):
+                page._scrollbar.grid() if needed else page._scrollbar.grid_remove()
+
+        page.bind("<Configure>", sync_scrollbar, add="+")
+        page._parent_canvas.bind("<Configure>", sync_scrollbar, add="+")
         return page
 
     def _row(self, master, label, tip=None):
@@ -557,7 +579,7 @@ class NexusPanel(ctk.CTk):
         self.st_ptr_interval.set(s.pointer_interval_seconds)
         if s.expanded:
             self.details.pack(fill="both", expand=True)
-            self.btn_expand.configure(text=self.glyph("up"))
+            self._set_expand_icon(True)
 
     def _fill_switch_menu(self):
         s = self.settings
@@ -661,17 +683,23 @@ class NexusPanel(ctk.CTk):
         self._apply(pointer_enabled=not self.settings.pointer_enabled)
         self.sw_pointer.select() if self.settings.pointer_enabled else self.sw_pointer.deselect()
 
+    def _set_expand_icon(self, expanded: bool) -> None:
+        self.btn_expand.configure(text="", image=self._chevrons[expanded])
+
     def toggle_expanded(self):
         expanded = not self.settings.expanded
         if expanded:
             self.details.pack(fill="both", expand=True)
-            self.btn_expand.configure(text=self.glyph("up"))
+            self._set_expand_icon(True)
             self.btn_expand.tooltip.text = "Hide settings"
         else:
             self.details.pack_forget()
-            self.btn_expand.configure(text=self.glyph("down"))
+            self._set_expand_icon(False)
             self.btn_expand.tooltip.text = "Show settings"
         self._apply(expanded=expanded)
+        # Let the window take the size of what it now shows (shrinks when settings are hidden).
+        self.update_idletasks()
+        tk.Tk.wm_geometry(self, "")
         self.after(20, self._keep_on_screen)
 
     # ----------------------------------------------------------------- target selection
