@@ -399,8 +399,9 @@ class NexusPanel(ctk.CTk):
                                "Alt+Page Up is its remote Alt+Tab. RDP Nexus picks the right one before every "
                                "switch.")
         ctk.CTkLabel(t, text="Selecting the window is enough: it can stay in the background or minimized while "
-                             "you use other apps (Options → Background). RDP Nexus never brings it forward and "
-                             "never sends input to your local apps.",
+                             "you use other apps (Options → Background). When a switch is due and you have paused, "
+                             "it comes forward for a moment and you get your window back. Keys never go to your "
+                             "local apps.",
                      font=self.f_small, text_color=C["faint"], wraplength=380, justify="left",
                      anchor="w").pack(fill="x", pady=(8, 0))
 
@@ -466,15 +467,17 @@ class NexusPanel(ctk.CTk):
         self.ptr_state_lbl.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(p, text="Moves stay inside the RDP window and never click. Your own mouse is only moved "
                              "while it rests over the active RDP window (touching it pauses that until you resume); "
-                             "everywhere else only the remote pointer moves.",
+                             "everywhere else only the remote pointer is nudged (best effort).",
                      font=self.f_small, text_color=C["faint"], wraplength=380, justify="left",
                      anchor="w").pack(fill="x", pady=(8, 0))
 
         # --- Options -----------------------------------------------------------------
         o = tabs.add("Options")
         row = self._row(o, "Background", "On: keeps the RDP session active while you use other apps, with the "
-                                         "RDP window behind them or minimized. Input is sent straight to the RDP "
-                                         "window, so your local apps, keyboard focus and mouse are never touched.\n"
+                                         "RDP window behind them or minimized. When an app switch is due and you "
+                                         "pause for 3 s (no typing or mouse use), the RDP window comes forward "
+                                         "for a moment, switches app, and the window you were using gets focus "
+                                         "back. Keys never go to your local apps.\n"
                                          "Off: automation only runs while the RDP window is the active window.")
         self.sw_background = self._switch(row, "Keep working while I use other apps", self._on_background)
         self.sw_background.pack(side="left")
@@ -615,10 +618,11 @@ class NexusPanel(ctk.CTk):
 
     def _update_test_hint(self):
         if self.settings.background_input:
-            self.test_hint.configure(text="RDP window can stay in the background")
-            self.test_tip.text = ("Runs one switch + scroll right away (no 13-minute wait), sent straight to the "
-                                  "RDP window. Keep the RDP window visible to watch it work. The result appears "
-                                  "in the status line and the Log tab.")
+            self.test_hint.configure(text="then keep still for a moment")
+            self.test_tip.text = ("Runs one switch + scroll right away (no 13-minute wait): press it and keep "
+                                  "still. The RDP window comes forward for a moment, switches app and scrolls, "
+                                  "then this window gets focus back. The result appears in the status line and "
+                                  "the Log tab.")
         else:
             self.test_hint.configure(text="then click into the RDP window")
             self.test_tip.text = ("Runs one switch + scroll right away (no 13-minute wait): press it, click inside "
@@ -627,7 +631,8 @@ class NexusPanel(ctk.CTk):
 
     def test_now(self):
         if self.engine.test_now():
-            self._flash_detail("Test: sending to the RDP window…" if self.settings.background_input
+            self._flash_detail("Test: keep still — the RDP window comes forward for a moment…"
+                               if self.settings.background_input
                                else "Test: click inside the RDP window now and keep still…")
 
     def _on_startup(self):
@@ -856,6 +861,8 @@ class NexusPanel(ctk.CTk):
 
         if not snap.keyboard_enabled and snap.state != DisplayState.STOPPED:
             self._set(self.count_lbl, text="—", text_color=C["faint"])
+        elif snap.switch_waiting:  # due: switches at your next short pause
+            self._set(self.count_lbl, text="due", text_color=C["paused"])
         else:
             self._set(self.count_lbl, text=fmt_countdown(snap.countdown_s),
                       text_color=C["text"] if snap.countdown_s is not None else C["faint"])

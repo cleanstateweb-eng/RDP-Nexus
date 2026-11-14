@@ -13,10 +13,11 @@ Either one suspends pointer automation immediately and it stays suspended
 until the user explicitly resumes it.  If the hook stops observing our own
 events, detection is considered broken and pointer automation is disabled.
 
-Background mode (glide_posted / wheel_posted) never touches the real pointer:
-it posts WM_MOUSEMOVE / WM_MOUSEWHEEL to the RDP input window, which moves only
-the *remote* pointer.  It is used whenever the real pointer is not resting over
-the RDP window, so you do not have to keep your mouse there.
+Background mode (glide_posted) never touches the real pointer: it posts
+WM_MOUSEMOVE to the RDP input window to move only the *remote* pointer.  It is
+used whenever the real pointer is not resting over the RDP window, so you do not
+have to keep your mouse there.  This is best effort: an RDP client may ignore it
+(the keyboard cycle, which brings the RDP window forward, keeps the session active).
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from ctypes import wintypes
 
 import winapi as w
-from background_input import point_lparam, wheel_wparam
+from background_input import point_lparam
 from input_safety import INJECTION_SIGNATURE, InjectionLedger, SafetyGate
 from keyboard_navigation import ActionResult
 from window_detection import Rect, RdpWindow, WindowInspector
@@ -388,21 +389,3 @@ class PointerController:
         x, y = self.bg_pos
         return GlideOutcome(ActionResult(True, "ok", f"Moved the remote pointer gently to {x}, {y} "
                                                      "(your mouse was not touched)"))
-
-    def wheel_posted(self, target: RdpWindow, down: bool, notches: int = 3) -> ActionResult:
-        """Mouse-wheel scroll for the RDP window in the background, without touching your mouse."""
-        verdict = self.gate.check_background(target)
-        if not verdict.ok:
-            return ActionResult(False, verdict.code, f"Mouse-wheel scroll skipped: {verdict.message}")
-        info = self.inspector.input_client_size(target)
-        point = self.inspector.client_to_screen(info[0], info[1] // 2, info[2] // 2) if info else None
-        if point is None:
-            return ActionResult(False, "outside", "Mouse-wheel scroll skipped: the RDP window has no visible area "
-                                                  "right now")
-        if self.bg_pos is not None:
-            point = self.inspector.client_to_screen(info[0], *self.bg_pos) or point
-        amount = (-1 if down else 1) * w.WHEEL_DELTA * notches
-        if not self._post(info[0], w.WM_MOUSEWHEEL, wheel_wparam(amount), point_lparam(*point)):
-            return ActionResult(False, "send_failed", "Mouse-wheel scroll could not be delivered to the RDP window")
-        return ActionResult(True, "ok", f"Scrolled {'down' if down else 'up'} with the mouse wheel in the "
-                                        f"background ({notches} notches)")

@@ -6,8 +6,9 @@ you choose*, and it can nudge the remote mouse pointer a few pixels within that 
 
 **Selecting the RDP window is enough.** With **background mode** (on by default) RDP Nexus keeps
 working while you use other apps: the RDP window can stay behind other windows or be minimized,
-and you don't have to keep your mouse over it. Input is sent straight to the RDP window, so your
-local apps, keyboard focus and mouse pointer are never touched.
+and you don't have to keep your mouse over it. When an app switch is due and you have paused for 10
+seconds, the RDP window comes forward for a moment, switches app, and the window you were using gets
+focus back. Keys never go to your local apps.
 
 ## ⬇️ [Download RDP Nexus for Windows](https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest/download/RDPNexus-setup.exe)
 
@@ -25,12 +26,13 @@ All dependencies, libraries, and Python runtimes are completely built into the a
 
 ### Option 1: Standard Installer (Recommended — 1-Click Setup)
 1. Click **[Download RDPNexus-setup.exe](https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest/download/RDPNexus-setup.exe)** (always the latest version).
-2. **Double-click** the downloaded setup file.
-3. If a blue Windows SmartScreen popup appears (*"Windows protected your PC"*):
-   - Click **More info**
-   - Click **Run anyway**
-4. Click **Next** and **Install** (No administrator privileges required!).
-5. Click **Finish** — RDP Nexus launches instantly, and shortcuts are added to your **Desktop** and **Start Menu**.
+2. **Double-click** the downloaded file. That's it: it installs in a few seconds with no questions (no
+   administrator rights needed), adds **Desktop** and **Start Menu** shortcuts, and starts RDP Nexus.
+   An older version that is running is closed and replaced automatically; your settings are kept.
+
+> **Only the first time:** because the app is new and not code-signed, your browser may ask you to **Keep**
+> the file, and Windows may show *"Windows protected your PC"*: click **More info → Run anyway**. These
+> warnings come from the browser and Windows, not from RDP Nexus, and can't be switched off by the app.
 
 ---
 
@@ -48,20 +50,21 @@ All dependencies, libraries, and Python runtimes are completely built into the a
    - Select your RDP window from the dropdown list, or
    - Click **Pick by clicking it** and click inside your RDP window.
 3. On the **Keys** tab, keep **Switch → Cycle through all apps** (default recommended).
-4. *(Optional test)* Keep the RDP window visible and press **Test now**. Within a couple of seconds you should see
-   an app switch and a scroll inside the remote session.
+4. *(Optional test)* Press **Test now** and keep still. The RDP window comes forward for a moment, switches to
+   another remote app and scrolls, then RDP Nexus gets focus back.
 5. Press **▶ Start**. That's it — carry on with your local apps. The status shows **Running in background**
    while the RDP window isn't the active window, and **Running** while it is.
 
-> **Safety note:** RDP Nexus never brings the RDP window to the front on its own and never sends input to your
-> local apps. Prefer the old behaviour (only act while the RDP window is active)? Turn off
-> **Options → Background**.
+> **Safety note:** keys only ever go to the RDP window while it is the active window, never to your local apps.
+> A due switch waits for a 3-second pause in your typing and mouse use; in background mode the RDP window is then
+> brought forward for under a second.
+> Prefer the old behaviour (only act while the RDP window is active)? Turn off **Options → Background**.
 
 ---
 
 ## ✨ Features
 
-- **Background mode** (default): keeps the session active while you work elsewhere — RDP window behind other windows, minimized or on another virtual desktop.
+- **Background mode** (default): keeps the session active while you work elsewhere — RDP window behind other windows or minimized. It comes forward for a moment for each app switch, once you've paused.
 - **Compact floating panel**: dark, rounded and draggable, with an optional always-on-top mode and a one-line status. Expand it for settings; minimize it to the taskbar (default) or the system tray.
 - **Start / Pause / Resume / Stop**, with a countdown to the next cycle and clear states: **Stopped**, **Running**, **Running in background**, **Paused**, **RDP Unavailable** and **Manual pointer control**.
 - **Cycle through all apps** (default): like pressing Alt+Tab to go through open applications. Every switch brings up the app used longest ago, visiting every open window in turn without needing an app count.
@@ -80,20 +83,17 @@ All dependencies, libraries, and Python runtimes are completely built into the a
 ### Two ways of delivering input
 | RDP window is… | How input is delivered | Your local apps / mouse |
 | --- | --- | --- |
-| **the active window** | Real key presses (SendInput), only when you haven't used the keyboard or mouse for 10 s | Untouched — keys only go to the active RDP window |
-| **in the background or minimized** (background mode) | Keyboard and mouse messages posted directly to the RDP window | Untouched — nothing else receives them, focus never changes |
+| **the active window** | Real key presses (SendInput), at your first 3-second pause in typing and mouse use | Untouched — keys only go to the active RDP window |
+| **in the background or minimized** (background mode) | At your first 3-second pause in typing and mouse use: the RDP window is brought forward for a moment (restored if minimized), the same real key presses are sent, then the window you were using gets focus back (and the RDP window is minimized again if it was) | Untouched — keys only go to the RDP window while it is in front |
 
-Background mode works with your normal use of the PC: typing in local apps does not hold it back. It still
-pauses when the RDP session shows a dialog or disconnects, when the RDP window is closed, when your PC is
-locked or the screen saver runs, and for a moment while you hold Shift, Ctrl, Alt or Win.
-
-> Microsoft doesn't document sending input to a Remote Desktop window in the background. If your RDP client
-> ignores it, background mode simply does nothing (see Troubleshooting). RDP Nexus never falls back to
-> bringing the RDP window to the front.
+Why the brief focus? The Remote Desktop client ignores keyboard input sent to it while it is not the active
+window (tested against `mstsc`), so there is no way to switch remote apps without it. Background mode still
+pauses when the RDP session shows a dialog or disconnects, when the RDP window is closed or on another
+virtual desktop, when your PC is locked or the screen saver runs, and while you hold a key. If you start
+typing or click somewhere during the moment it is in front, the keys stop at once and the switch is retried.
 
 ### Keyboard Navigation (Every *N* minutes, default 13)
-Each cycle sends **one** switch action, then **one** scroll once the switched-to app has appeared (in the
-background a fixed 1.5 s wait is used instead).
+Each cycle sends **one** switch action, then **one** scroll once the switched-to app has appeared.
 
 | Mode | Switch options | Notes |
 | --- | --- | --- |
@@ -114,13 +114,14 @@ Scroll: Page Down/Page Up, Arrow Down/Up, mouse wheel (or Off), with direction *
 - **Your pointer resting over the active RDP window:** arms after 3 s of rest and moves your pointer gently.
   Any physical mouse movement or click immediately switches to **Manual control** until you press *Resume pointer*.
 - **Anywhere else** (RDP in the background, or your pointer on another window/monitor): only the **remote**
-  pointer moves; your own mouse pointer is never moved.
+  pointer is nudged (best effort — some RDP clients ignore it); your own mouse pointer is never moved and the
+  RDP window is never brought forward for this.
 - Stays strictly inside the RDP window area and never clicks, drags, or types.
 
 ### Input Isolation Safeguards
 - **Explicit target**: Only valid Remote Desktop session windows (`mstsc.exe` / `msrdc.exe`) are accepted. Local windows are completely ignored.
 - **Pre-action validation**: Re-verifies the window handle, connection state and responsiveness before every single event.
-- **Fail closed**: Real key presses stop the instant the RDP window stops being the active window; background input stops the instant the RDP window becomes active (you may be typing into it) or the session becomes unavailable. Held keys are always released.
+- **Fail closed**: Real key presses stop the instant the RDP window stops being the active window or you touch the keyboard or mouse; held keys are always released, and in background mode your window gets focus back.
 
 ---
 
@@ -137,10 +138,10 @@ Scroll: Page Down/Page Up, Arrow Down/Up, mouse wheel (or Off), with direction *
 
 ## 🛠️ Troubleshooting
 
-- **Nothing happens while the RDP window is in the background:**
-  Keep the RDP window visible next to another app, click the other app, then press **Keys → Test now** and watch the
-  remote screen. If it doesn't switch or scroll, your RDP client ignores background input: turn off
-  **Options → Background** and keep the RDP window active while RDP Nexus runs.
+- **The RDP window doesn't come forward in the background:**
+  A due switch waits for a 3-second pause in your typing and mouse use (the countdown shows **due** and the
+  status line says so). If Windows
+  refuses to let it bring the window forward, the Log tab says so and it tries again a minute later.
 - **Status says "RDP Unavailable – not the active window":**
   Background mode is off. Turn on **Options → Background**, or click inside the RDP window.
 - **RDP window isn't in the list:**
@@ -178,7 +179,7 @@ from a fresh copy: it only packages the program that `build_windows.bat` builds 
 
 ### Publishing a release
 1. Bump `APP_VERSION` in `src/app_info.py` and add `docs/releases/v<version>.md`.
-2. Commit, then tag and push: `git tag v1.0.6` and `git push origin v1.0.6`.
+2. Commit, then tag and push: `git tag v1.0.7` and `git push origin v1.0.7`.
 3. GitHub Actions (*Build and release*) tests and builds everything on GitHub's own Windows machine,
    checks the tag matches `APP_VERSION`, and publishes the Release with the installer, the portable exe,
    `SHA256SUMS.txt` and `RDPNexus-setup.exe` (the file behind the one-click download link).

@@ -435,29 +435,34 @@ def bg_app():
     fake.close()
 
 
-def test_background_mode_input_reaches_only_the_rdp_window(bg_app):
+def test_background_switch_brings_rdp_forward_then_gives_focus_back(bg_app):
+    """The fake RDP window is behind another window.  When the switch is due, RDP Nexus brings it
+    forward for a moment, sends the keys (real SendInput, so only to that window), and the window
+    that was active before gets focus back.  Don't touch the keyboard or mouse while it runs."""
     engine, inspector, target = build(bg_app, background_input=True, interval_s=1.0, switch_shortcut="alt_pageup",
-                                      scroll_key="page", pointer_enabled=True, pointer_interval_s=0.5)
-    ledger = engine.keyboard.ledger
+                                      scroll_key="page", pointer_enabled=False, idle_guard_s=0.3)
+    before = inspector.foreground_root()
     mark = bg_app.mark()
     try:
         assert engine.start()
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline and (engine.snapshot().cycles < 1 or not bg_app.since(mark, "move")):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and engine.snapshot().cycles < 1:
             time.sleep(0.1)
+        time.sleep(0.5)
         snap = engine.snapshot()
-        assert snap.state == DisplayState.BACKGROUND, snap.detail
         assert snap.cycles >= 1, [e.message for e in snap.events]
     finally:
         engine.shutdown()
     keys = bg_app.since(mark, "key")
     assert keys and all(e["window"] == "rdp" for e in keys)
-    assert keys_of(keys)[:4] == [(*ALT, True), (*PGUP, True), (*PGUP, False), (*ALT, False)]
+    # background mode scrolls the app showing now, then switches (keeps the borrowed moment short)
+    assert keys_of(keys)[:6] == [(*PGDN, True), (*PGDN, False), (*ALT, True), (*PGUP, True), (*PGUP, False),
+                                 (*ALT, False)]
     downs = sum(1 for e in keys if e["down"])
     assert downs == len(keys) - downs  # every key that went down came back up
-    moves = bg_app.since(mark, "move")
-    assert moves and all(e["window"] == "rdp" for e in moves)
-    assert not bg_app.since(mark, window="local")  # the local app received nothing
+    assert not bg_app.since(mark, "key", window="local")  # the local app received no keys
     assert not bg_app.since(mark, "click")
-    assert ledger.last is None  # SendInput was never used
-    assert inspector.foreground_root() != target.hwnd  # RDP Nexus never brought the RDP window forward
+    assert inspector.foreground_root() == before  # the window you were using has focus again
+    messages = [e.message for e in engine.snapshot().events]
+    assert any("Brought the RDP window forward" in m for m in messages)
+    assert any("Gave focus back" in m for m in messages)

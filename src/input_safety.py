@@ -126,6 +126,23 @@ class SafetyGate:
         with self._lock:
             self._last_user_activity = self._clock()
 
+    def activity_marker(self) -> float | None:
+        """Opaque snapshot of the user-activity state, for absorb_input_since()."""
+        with self._lock:
+            return self._last_user_activity
+
+    def absorb_input_since(self, marker: float | None) -> None:
+        """Input registered since `marker` was caused by RDP Nexus itself, not by you.
+
+        Used right after bringing the RDP window forward: the Remote Desktop client injects a
+        couple of key events when it gets focus (seen live), which would otherwise look like you
+        typing and cancel the switch.  Anything registered after this call counts as you again.
+        """
+        last = self._last_input()
+        with self._lock:
+            self._seen_input_tick = last
+            self._last_user_activity = marker
+
     # -- physical state -------------------------------------------------------------
     def held_keys(self) -> list[str]:
         return sorted({name for vk, name in _HELD_KEYS if self._key_down(vk)})
@@ -186,14 +203,14 @@ class SafetyGate:
 
     def check_background(self, target: RdpWindow | None, idle_guard_s: float | None = None,
                          allow_foreground: bool = False) -> Verdict:
-        """Gate for background mode (messages posted to the RDP window; nothing else is touched).
+        """Gate for background remote-pointer moves (WM_MOUSEMOVE posted to the RDP window only).
 
-        Posted input only ever reaches the RDP window, so your use of local apps does not block
-        it (no idle guard unless one is given).  It still fails closed when the window is gone,
+        Posted moves only ever reach the RDP window, so your use of local apps does not block
+        them (no idle guard unless one is given).  It still fails closed when the window is gone,
         hung, showing a dialog or disconnected, when this computer is locked, and while you hold
         Shift/Ctrl/Alt/Win.  Unless `allow_foreground`, it also stops as soon as the RDP window
-        becomes the active window: from then on you may be typing into it, and the normal
-        (SendInput) path with its idle guard takes over.
+        becomes the active window: from then on you may be using it, and the normal path takes over.
+        Keys are never posted: they always go through check_keyboard + SendInput.
         """
         st = self.inspector.check(target, require_foreground=False, allow_background=True)
         if not st.ok:

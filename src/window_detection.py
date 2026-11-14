@@ -115,7 +115,7 @@ _STATUS_TEXT = {
     DIALOG: "RDP client is showing a dialog (session may be disconnected)",
     DISCONNECTED: "RDP session appears disconnected",
     NOT_FOREGROUND: "RDP window is not the active window",
-    BACKGROUND: "Connected · in the background (input goes straight to the RDP window)",
+    BACKGROUND: "Connected · in the background (brought forward for a moment to switch apps)",
 }
 _USABLE = frozenset({OK, BACKGROUND})
 
@@ -291,8 +291,9 @@ class WindowInspector:
               allow_background: bool = False) -> TargetStatus:
         """Validate the target.  Order matters: the cheapest decisive checks run first.
 
-        `allow_background` accepts a window that is minimized or on another virtual desktop
-        (background mode posts input to it instead of needing it on screen and active).
+        `allow_background` also accepts a minimized window: background mode restores it for the
+        moment it brings it forward.  A window on another virtual desktop is never accepted
+        (bringing it forward would switch your desktop).
         """
         if target is None:
             return status(NO_TARGET)
@@ -305,7 +306,7 @@ class WindowInspector:
             return status(HUNG)
         if not allow_background and w.IsIconic(hwnd):
             return status(MINIMIZED)
-        if not w.IsWindowVisible(hwnd) or (not allow_background and self.is_cloaked(hwnd)):
+        if not w.IsWindowVisible(hwnd) or self.is_cloaked(hwnd):
             return status(HIDDEN)
         if not w.IsWindowEnabled(hwnd) or self.owned_dialog_visible(hwnd, target.pid):
             return status(DIALOG)

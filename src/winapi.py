@@ -1,11 +1,11 @@
 """Minimal ctypes bindings for the documented Win32 APIs RDP Nexus relies on.
 
 Only user32 / kernel32 / dwmapi functions are used, every one of them with
-explicit argtypes/restype so 64-bit handles are never truncated.  Input for the
-active window goes through SendInput (the documented, foreground-routed input
-path).  The only window messages posted to another process are the keyboard and
-mouse messages of background mode, and only to the selected RDP window's input
-window (see background_input.py).
+explicit argtypes/restype so 64-bit handles are never truncated.  Keyboard input
+goes only through SendInput (the documented, foreground-routed input path), and
+only while the RDP window is the active window.  The only window messages posted
+to another process are the remote-pointer mouse moves of background mode, and
+only to the selected RDP window's input window (see background_input.py).
 """
 
 from __future__ import annotations
@@ -75,6 +75,8 @@ WS_MINIMIZEBOX = 0x00020000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 SW_MINIMIZE = 6
+SW_SHOWMINNOACTIVE = 7
+SW_RESTORE = 9
 
 VK_LBUTTON = 0x01
 VK_RBUTTON = 0x02
@@ -205,6 +207,9 @@ GetUserObjectInformationW = _bind(user32, "GetUserObjectInformationW", wintypes.
                                   ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
 SystemParametersInfoW = _bind(user32, "SystemParametersInfoW", wintypes.BOOL, wintypes.UINT, wintypes.UINT,
                               wintypes.LPVOID, wintypes.UINT)
+AttachThreadInput = _bind(user32, "AttachThreadInput", wintypes.BOOL, wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+SetForegroundWindow = _bind(user32, "SetForegroundWindow", wintypes.BOOL, wintypes.HWND)
+BringWindowToTop = _bind(user32, "BringWindowToTop", wintypes.BOOL, wintypes.HWND)
 GetParent = _bind(user32, "GetParent", wintypes.HWND, wintypes.HWND)
 ShowWindow = _bind(user32, "ShowWindow", wintypes.BOOL, wintypes.HWND, ctypes.c_int)
 MessageBoxW = _bind(user32, "MessageBoxW", ctypes.c_int, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,

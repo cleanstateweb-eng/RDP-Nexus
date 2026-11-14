@@ -55,34 +55,78 @@ UninstallDisplayName={#AppName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Refuse to install/uninstall underneath a running copy (same mutex the app creates).
-AppMutex=RDPNexus.SingleInstance
-CloseApplications=yes
+; One double-click installs: no wizard pages, just a progress window, then RDP Nexus starts.
+DisableWelcomePage=yes
+DisableDirPage=yes
+DisableReadyPage=yes
+DisableFinishedPage=yes
+; A running RDP Nexus (an upgrade) is closed automatically instead of asking (see [Code]).
+CloseApplications=no
 RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-
-[Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "startup"; Description: "Launch {#AppName} when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "RDP-only keyboard and pointer automation"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"
 
 [Registry]
-; Optional launch at sign-in (the app's own "Launch when I sign in" switch edits the same value).
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --minimized"; Tasks: startup
-; Always remove that value on uninstall, however it was created.
+; Launch at sign-in is switched on/off in the app (Options -> Startup); always remove it on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#AppName}"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Start RDP Nexus as soon as it is installed.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: ShouldLaunch
 
 [UninstallDelete]
 ; Log files are app-generated; user settings in %APPDATA%\RDP Nexus are kept.
 Type: filesandordirs; Name: "{localappdata}\RDP Nexus\logs"
+
+[Code]
+procedure CloseRunningCopy();
+var
+  ResultCode: Integer;
+begin
+  // An older RDP Nexus that is still running would lock its files: close it without asking.
+  Log('Closing a running copy of {#AppExe}, if any');
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log(Format('taskkill finished (exit code %d)', [ResultCode]));
+end;
+
+function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  if not WizardSilent() then
+  begin
+    // Double-clicked: Inno Setup always stops on its "Ready to Install" page when every other page is
+    // off, so run this same installer in silent mode instead (a progress bar only, no pages, no
+    // questions), and start RDP Nexus at the end.  This copy then exits.
+    if Exec(ExpandConstant('{srcexe}'), '/SILENT /SUPPRESSMSGBOXES /NORESTART /LAUNCH=1', '', SW_SHOW,
+            ewNoWait, ResultCode) then
+      Result := False;
+  end;
+end;
+
+function ShouldLaunch(): Boolean;
+begin
+  // Start RDP Nexus after a double-click install; a scripted silent install (without /LAUNCH=1) does not.
+  Result := (not WizardSilent()) or (ExpandConstant('{param:LAUNCH|0}') = '1');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  CloseRunningCopy();
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  CloseRunningCopy();
+  Result := True;
+end;

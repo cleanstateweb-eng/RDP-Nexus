@@ -58,7 +58,7 @@ class FakeInspector:
             return status("no_target")
         if self.code == NOT_FOREGROUND and not require_foreground:
             return status(OK)
-        if allow_background and self.code in (NOT_FOREGROUND, MINIMIZED, HIDDEN):
+        if allow_background and self.code in (NOT_FOREGROUND, MINIMIZED):
             return status(OK)
         return status(self.code)
 
@@ -79,6 +79,42 @@ class FakeGate:
 
     def mark_user_activity(self):
         self.last_activity = self.clock()
+
+    held = ()
+
+    def activity_marker(self):
+        return self.last_activity
+
+    def absorb_input_since(self, marker):
+        self.absorbed = getattr(self, "absorbed", 0) + 1
+        self.last_activity = marker
+
+    def held_keys(self):
+        return list(self.held)
+
+    def held_buttons(self):
+        return []
+
+    def user_active_within(self, seconds):
+        since = self.seconds_since_user_activity()
+        return since is not None and since < seconds
+
+
+class FakeFocus:
+    """Stands in for focus_borrow.FocusBorrower: records bring-forward / give-back."""
+
+    def __init__(self):
+        self.calls = []
+        self.refuse = False
+
+    def bring_forward(self, target):
+        from focus_borrow import Borrow
+        self.calls.append("forward")
+        return Borrow(False, "Windows did not let RDP Nexus bring the RDP window forward") if self.refuse \
+            else Borrow(True, "", previous=900)
+
+    def give_back(self, target, borrow):
+        self.calls.append("back")
 
 
 class FakeRdpKeys:
@@ -178,7 +214,7 @@ def env():
     mon = FakeMonitor()
     ptr = FakePointer(mon)
     eng = AutomationEngine(insp, gate, kb, ptr, mon, CFG, clock=clock, cursor=ptr._cursor, start_thread=False,
-                           rdp_keys=FakeRdpKeys(), screen_watcher=FakeScreen())
+                           rdp_keys=FakeRdpKeys(), screen_watcher=FakeScreen(), focus=FakeFocus())
     return eng, clock, insp, gate, kb, mon, ptr
 
 
@@ -364,7 +400,7 @@ def test_keyboard_disabled_means_no_countdown(env):
     assert kb.sent == [] and eng.snapshot().countdown_s is None
 
 
-def test_skipped_action_reports_reason_and_restarts(env):
+def test_skipped_action_is_retried_at_your_next_pause_not_after_a_full_interval(env):
     eng, clock, insp, gate, kb, *_ = env
     eng.set_target(TARGET)
     eng.start()
@@ -373,7 +409,9 @@ def test_skipped_action_reports_reason_and_restarts(env):
     run_for(eng, clock, 2)
     snap = eng.snapshot()
     assert "Skipped" in snap.detail and kb.sent == []
-    assert snap.countdown_s == pytest.approx(779, abs=1)
+    assert snap.countdown_s <= CFG.retry_s  # retried in a moment, the whole countdown is NOT restarted
+    run_for(eng, clock, 2)
+    assert kb.sent == [(("alt", "pageup"), 1), (("pagedown",), 1)]
 
 
 def test_focus_change_during_send_suspends(env):
@@ -651,29 +689,104 @@ def start_background(env, cfg=BCFG, code=NOT_FOREGROUND):
     return eng, clock, insp, gate, kb, mon, ptr
 
 
-def test_background_runs_cycles_without_focus(env):
+def test_background_brings_rdp_forward_for_the_switch_then_gives_focus_back(env):
     eng, clock, insp, gate, kb, *_ = start_background(env)
     snap = eng.snapshot()
     assert snap.state == DisplayState.BACKGROUND and snap.countdown_s == pytest.approx(780)
     assert snap.target_status.ok and "background" in snap.target_status.message
     run_for(eng, clock, 781)
-    assert kb.sent == [(("alt", "pageup"), 1), (("pagedown",), 1)]
-    assert kb.modes == ["background", "background"]
+    assert eng.focus.calls == ["forward", "back"]
+    # the normal foreground keys; scroll first so the RDP window is in front for well under a second
+    assert kb.sent == [(("pagedown",), 1), (("alt", "pageup"), 1)]
+    assert eng.screen.waits == []  # no waiting for the new app while the window is borrowed
+    assert snap.countdown_s is not None and eng.snapshot().cycles == 1
 
 
-@pytest.mark.parametrize("code", [MINIMIZED, HIDDEN])
-def test_background_works_when_minimized_or_on_another_desktop(env, code):
-    eng, clock, insp, gate, kb, *_ = start_background(env, code=code)
-    run_for(eng, clock, 781)
-    assert len(kb.sent) == 2 and set(kb.modes) == {"background"}
-
-
-def test_background_uses_rdps_own_alt_tab_even_if_alt_tab_would_be_forwarded(env):
+def test_background_uses_the_same_keys_as_when_rdp_is_active(env):
     eng, clock, insp, gate, kb, *_ = env
-    eng.rdp_keys = FakeRdpKeys(1)  # "apply Windows key combinations on the remote computer"
-    eng, clock, insp, gate, kb, *_ = start_background(env, EngineConfig(**{**BCFG.__dict__, "scroll_key": "off"}))
+    insp.fullscreen = True  # your setup: full screen with the default keyboard setting
+    start_background(env, EngineConfig(**{**BCFG.__dict__, "scroll_key": "off"}))
     run_for(eng, clock, 781)
-    assert kb.sent == [(("alt", "pageup"), 1)]  # Alt+Tab never leaves RDP Nexus without the RDP window in front
+    assert kb.sent == [(("alt", "tab"), 1)]  # real Alt+Tab, exactly like 1.0.4 in front
+
+
+def test_minimized_rdp_window_still_gets_its_switch(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env, code=MINIMIZED)
+    run_for(eng, clock, 781)
+    assert len(kb.sent) == 2 and eng.focus.calls == ["forward", "back"]
+
+
+def test_rdp_on_another_virtual_desktop_is_not_brought_forward(env):
+    eng, clock, insp, gate, kb, *_ = env
+    eng.set_config(BCFG)
+    eng.set_target(TARGET)
+    insp.code = HIDDEN
+    assert not eng.start()  # it would switch your desktop: unavailable instead
+
+
+def test_due_switch_waits_for_a_short_pause_then_goes_ahead(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env)
+    run_for(eng, clock, 779)
+    gate.mark_user_activity()  # you are working in a local app when the switch is due
+    run_for(eng, clock, 2)
+    snap = eng.snapshot()
+    assert eng.focus.calls == [] and kb.sent == []
+    assert snap.switch_waiting and "waiting for a 3-second pause" in snap.detail  # panel shows "due"
+    gate.mark_user_activity()  # still busy...
+    run_for(eng, clock, 2)
+    assert eng.focus.calls == [] and eng.snapshot().switch_waiting
+    run_for(eng, clock, 3)  # a 3-second pause: it goes ahead
+    assert eng.focus.calls == ["forward", "back"] and len(kb.sent) == 2
+    snap = eng.snapshot()
+    assert not snap.switch_waiting and snap.countdown_s > 770  # next switch a full interval later
+    due = [e for e in snap.events if "App switch due" in e.message]
+    assert len(due) == 1  # logged once, not every retry
+
+
+def test_due_switch_waits_for_a_pause_with_the_rdp_window_in_front_too(env):
+    eng, clock, insp, gate, kb, *_ = env
+    eng.set_target(TARGET)
+    eng.start()
+    run_for(eng, clock, 779)
+    gate.mark_user_activity()  # you are typing in the RDP window
+    run_for(eng, clock, 2)
+    assert kb.sent == [] and eng.snapshot().switch_waiting
+    assert eng.snapshot().countdown_s <= CFG.retry_s  # not back to 13 minutes
+    run_for(eng, clock, 3)
+    assert kb.sent == [(("alt", "pageup"), 1), (("pagedown",), 1)]
+
+
+def test_background_waits_while_a_key_is_held(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env)
+    gate.held = ("Shift",)
+    run_for(eng, clock, 790)
+    assert eng.focus.calls == [] and kb.sent == []
+    gate.held = ()
+    run_for(eng, clock, 6)
+    assert len(kb.sent) == 2
+
+
+def test_refused_focus_change_retries_in_a_minute(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env)
+    eng.focus.refuse = True
+    run_for(eng, clock, 781)
+    assert kb.sent == [] and eng.focus.calls == ["forward"]  # no keys unless the RDP window is in front
+    assert eng.snapshot().countdown_s == pytest.approx(60, abs=1.5)
+    eng.focus.refuse = False
+    run_for(eng, clock, 61)
+    assert len(kb.sent) == 2 and eng.focus.calls == ["forward", "forward", "back"]
+
+
+def test_focus_change_during_a_borrowed_moment_only_postpones(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env)
+    run_for(eng, clock, 779)
+    kb.next_result = ActionResult(False, "focus_changed", "Focus left the RDP window")
+    run_for(eng, clock, 1)
+    snap = eng.snapshot()
+    assert snap.state == DisplayState.BACKGROUND and eng.focus.calls == ["forward", "back"]
+    assert snap.countdown_s <= BCFG.retry_s and kb.sent == []
+    run_for(eng, clock, 2)  # tried again a moment later
+    assert len(kb.sent) == 2 and eng.focus.calls == ["forward", "back", "forward", "back"]
 
 
 def test_switching_between_rdp_and_local_apps_keeps_the_countdown(env):
@@ -683,10 +796,9 @@ def test_switching_between_rdp_and_local_apps_keeps_the_countdown(env):
     eng.step()
     snap = eng.snapshot()
     assert snap.state == DisplayState.RUNNING and snap.countdown_s == pytest.approx(380)
-    insp.code = NOT_FOREGROUND
-    run_for(eng, clock, 380)
-    assert kb.modes == ["background", "background"]
-    assert any("input now goes straight to it" in e.message for e in eng.snapshot().events)
+    run_for(eng, clock, 381)
+    assert eng.focus.calls == [] and len(kb.sent) == 2  # in front: no borrowing needed
+    assert any("bring it forward for a moment" in e.message for e in eng.snapshot().events)
 
 
 def test_background_still_stops_for_dialogs_and_closed_windows(env):
@@ -695,31 +807,23 @@ def test_background_still_stops_for_dialogs_and_closed_windows(env):
     eng.step()
     assert eng.snapshot().state == DisplayState.UNAVAILABLE
     run_for(eng, clock, 3600)
-    assert kb.sent == []
+    assert kb.sent == [] and eng.focus.calls == []
     insp.code = CLOSED
     eng.step()
     assert eng.snapshot().state == DisplayState.STOPPED
 
 
-def test_background_held_modifier_retries_soon(env):
-    eng, clock, insp, gate, kb, *_ = start_background(env)
-    run_for(eng, clock, 779)
-    kb.next_result = ActionResult(False, "held", "Skipped Alt+Page Up: Shift is held down")
-    run_for(eng, clock, 2)
-    assert eng.snapshot().countdown_s == pytest.approx(BCFG.background_retry_s, abs=1)
-    run_for(eng, clock, 6)
-    assert len(kb.sent) == 2
-
-
-def test_test_now_runs_immediately_in_the_background(env):
+def test_test_now_in_background_waits_for_stillness_then_borrows_focus(env):
     eng, clock, insp, gate, kb, *_ = env
     eng.set_config(BCFG)
     eng.set_target(TARGET)
     insp.code = NOT_FOREGROUND
-    gate.mark_user_activity()  # you just clicked "Test now": no need to keep still
+    gate.mark_user_activity()  # you just clicked "Test now"
     assert eng.test_now()
     eng.step()
-    assert kb.modes == ["background", "background"] and not eng.testing
+    assert kb.sent == [] and "keep still" in eng.snapshot().detail
+    run_for(eng, clock, 2)
+    assert eng.focus.calls == ["forward", "back"] and len(kb.sent) == 2 and not eng.testing
     assert eng.snapshot().state == DisplayState.STOPPED
 
 
@@ -733,6 +837,7 @@ def test_background_pointer_moves_only_the_remote_pointer(env):
     assert snap.pointer_state == PointerState.BACKGROUND and not mon.armed
     run_for(eng, clock, 61)
     assert ptr.glides == 0 and ptr.posted == [{"guard": None, "foreground": False}]
+    assert eng.focus.calls == []  # pointer nudges never take focus
     assert eng.snapshot().pointer_countdown_s == pytest.approx(60, abs=1)
 
 
@@ -763,10 +868,10 @@ def test_manual_control_is_remembered_across_background_periods(env):
     mon.triggered, mon.reason = True, "mouse moved"
     eng.step()
     assert eng.snapshot().pointer_state == PointerState.MANUAL
-    insp.code = NOT_FOREGROUND  # you went to a local app: the remote pointer keeps moving
+    insp.code = NOT_FOREGROUND
     eng.step()
     assert eng.snapshot().pointer_state == PointerState.BACKGROUND
-    insp.code = OK  # back in the RDP window: your manual control still stands
+    insp.code = OK
     eng.step()
     assert eng.snapshot().pointer_state == PointerState.MANUAL
     eng.resume_pointer()
@@ -778,3 +883,9 @@ def test_background_off_keeps_the_old_behaviour(env):
     eng.set_target(TARGET)
     insp.code = MINIMIZED
     assert not eng.start()  # foreground-only mode cannot start on a minimized window
+
+
+def test_borrowed_moment_ignores_the_rdp_clients_own_focus_keys(env):
+    eng, clock, insp, gate, kb, *_ = start_background(env)
+    run_for(eng, clock, 781)
+    assert getattr(gate, "absorbed", 0) == 1  # input caused by bringing the window forward is not you

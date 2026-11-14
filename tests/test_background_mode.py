@@ -1,51 +1,126 @@
-"""Background mode: input posted to the RDP window only, never through SendInput.
-
-No real input is sent: the poster, gate and inspector are fakes that record
-what would have been delivered.
+"""Background mode: the RDP window is brought forward for a moment (keys), and the remote
+pointer is nudged with posted mouse moves.  No real input or focus change happens here:
+the Win32 calls, poster, gate and inspector are fakes that record what would have happened.
 """
 
 import random
 import threading
 
 import winapi as w
-from background_input import key_lparam, key_message, point_lparam, wheel_wparam
+from background_input import point_lparam
+from focus_borrow import FocusBorrower
 from input_safety import ALLOWED, Verdict
-from keyboard_navigation import PACING, KeyboardNavigator
 from pointer_controller import PointerController, permitted_area
 from window_detection import BACKGROUND, NOT_FOREGROUND, OK, Rect, RdpWindow, status
 
 TARGET = RdpWindow(42, 7, "mstsc.exe", "TscShellContainerClass", "host - Remote Desktop Connection", True)
 INPUT_HWND = 777
+LOCAL_APP = 900
 
 
-# --- pure helpers -----------------------------------------------------------------------
-
-def test_key_lparam_matches_windows_layout():
-    assert key_lparam(0x38, False, True, True) == 0x20380001            # Alt down: context bit set
-    assert key_lparam(0x49, True, True, True) == 0x21490001             # Page Up down while Alt held
-    assert key_lparam(0x49, True, False, True) == 0xE1490001            # ... released (bits 30, 31)
-    assert key_lparam(0x38, False, False, False) == 0xC0380001          # Alt released after the chord
-
-
-def test_key_message_uses_sys_variants_only_while_alt_is_held():
-    assert key_message(True, True) == w.WM_SYSKEYDOWN
-    assert key_message(False, True) == w.WM_SYSKEYUP
-    assert key_message(True, False) == w.WM_KEYDOWN
-    assert key_message(False, False) == w.WM_KEYUP
-
-
-def test_point_and_wheel_params():
+def test_point_lparam():
     assert point_lparam(10, 20) == (20 << 16) | 10
     assert point_lparam(-1, -2) == 0xFFFEFFFF  # signed 16-bit coordinates (monitors left of / above primary)
-    assert wheel_wparam(-360) == ((-360) & 0xFFFF) << 16
-    assert wheel_wparam(120) == 120 << 16
 
 
 def test_background_status_counts_as_usable():
     assert status(BACKGROUND).ok and status(OK).ok and not status(NOT_FOREGROUND).ok
 
 
-# --- keyboard -----------------------------------------------------------------------------
+def test_no_key_posting_left():
+    import keyboard_navigation
+    assert not hasattr(keyboard_navigation.KeyboardNavigator, "_post_chord")  # mstsc ignores posted keys
+
+
+# --- bringing the RDP window forward for a moment -----------------------------------------
+
+class Desktop:
+    """Fake foreground/minimize state, with a switch for Windows refusing focus changes."""
+
+    def __init__(self, foreground=LOCAL_APP, minimized=False, refuse=False):
+        self.foreground = foreground
+        self.minimized = {TARGET.hwnd: minimized}
+        self.refuse = refuse
+        self.calls = []
+
+    # inspector side
+    def foreground_root(self):
+        return self.foreground
+
+    def is_foreground(self, target):
+        return self.foreground == target.hwnd
+
+    # Win32 side
+    def is_iconic(self, hwnd):
+        return self.minimized.get(hwnd, False)
+
+    def is_window(self, hwnd):
+        return hwnd in (TARGET.hwnd, LOCAL_APP)
+
+    def show(self, hwnd, cmd):
+        self.calls.append(("show", hwnd, cmd))
+        self.minimized[hwnd] = cmd in (w.SW_MINIMIZE, w.SW_SHOWMINNOACTIVE)
+
+    def activate(self, hwnd):
+        self.calls.append(("activate", hwnd))
+        if not self.refuse or hwnd != TARGET.hwnd:
+            self.foreground = hwnd
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def borrower(desk):
+    clock = Clock()
+    return FocusBorrower(desk, api=desk, sleep=clock.sleep, clock=clock), clock
+
+
+def test_bring_forward_then_give_back_returns_your_window():
+    desk = Desktop()
+    fb, clock = borrower(desk)
+    b = fb.bring_forward(TARGET)
+    assert b.ok and b.previous == LOCAL_APP and desk.foreground == TARGET.hwnd
+    assert clock.t >= 0.35  # settle time so the RDP client takes the keyboard before keys are sent
+    fb.give_back(TARGET, b)
+    assert desk.foreground == LOCAL_APP
+
+
+def test_minimized_rdp_window_is_restored_for_the_moment_and_minimized_again():
+    desk = Desktop(minimized=True)
+    fb, _ = borrower(desk)
+    b = fb.bring_forward(TARGET)
+    assert b.ok and b.was_minimized and ("show", TARGET.hwnd, w.SW_RESTORE) in desk.calls
+    fb.give_back(TARGET, b)
+    assert desk.foreground == LOCAL_APP and desk.minimized[TARGET.hwnd]
+    assert desk.calls[-1] == ("show", TARGET.hwnd, w.SW_SHOWMINNOACTIVE)  # minimized without stealing focus
+
+
+def test_refused_focus_change_puts_everything_back():
+    desk = Desktop(minimized=True, refuse=True)
+    fb, clock = borrower(desk)
+    b = fb.bring_forward(TARGET)
+    assert not b.ok and "did not let" in b.message
+    assert desk.foreground == LOCAL_APP and desk.minimized[TARGET.hwnd]
+    assert clock.t <= 2.0  # gives up quickly
+
+
+def test_give_back_skips_a_window_that_closed_meanwhile():
+    desk = Desktop(foreground=12345)  # not a window any more by the time we give focus back
+    fb, _ = borrower(desk)
+    b = fb.bring_forward(TARGET)
+    fb.give_back(TARGET, b)
+    assert desk.calls.count(("activate", 12345)) == 0 and desk.foreground == TARGET.hwnd
+
+
+# --- remote pointer (posted mouse moves) ------------------------------------------------------
 
 class Inspector:
     def __init__(self):
@@ -53,14 +128,8 @@ class Inspector:
         self.area = Rect(100, 50, 900, 650)
         self.root = 42
 
-    def input_window(self, target):
-        return INPUT_HWND
-
     def input_client_size(self, target):
         return self.size
-
-    def client_to_screen(self, hwnd, x, y):
-        return x + 100, y + 50
 
     def input_area(self, target):
         return self.area
@@ -73,19 +142,16 @@ class Inspector:
 
 
 class Gate:
-    """check_background only: the foreground gate (check_keyboard / check_pointer) must never be used."""
-
     def __init__(self):
         self.inspector = Inspector()
         self.calls = []
-        self.fail_from = None  # 1-based call number from which the gate refuses
+        self.refuse = False
         self.foreground = False
 
     def check_background(self, target, idle_guard_s=None, allow_foreground=False):
         self.calls.append((idle_guard_s, allow_foreground))
-        if self.fail_from is not None and len(self.calls) >= self.fail_from:
-            return Verdict(False, "now_foreground", "the RDP window became the active window")
-        return ALLOWED
+        return Verdict(False, "now_foreground", "the RDP window became the active window") if self.refuse \
+            else ALLOWED
 
     def still_foreground(self, target):
         return self.foreground
@@ -99,89 +165,15 @@ class Poster:
         self.posts.append((hwnd, msg, wparam, lparam))
         return True
 
-    def keys(self):
-        """(message, vk, scan, extended, alt-context, released) for every posted key message."""
-        return [(m, wp, (lp >> 16) & 0xFF, bool(lp >> 24 & 1), bool(lp >> 29 & 1), bool(lp >> 31 & 1))
-                for _h, m, wp, lp in self.posts]
-
 
 def no_send_input(_inputs):
-    raise AssertionError("background mode must never use SendInput")
+    raise AssertionError("remote-pointer moves must never use SendInput")
 
 
 class Ledger:
     def record(self):
         raise AssertionError("posted messages are not SendInput injections")
 
-
-def navigator(gate=None):
-    gate = gate or Gate()
-    poster = Poster()
-    nav = KeyboardNavigator(gate, Ledger(), send=no_send_input, sleep=lambda s: None, post=poster)
-    return nav, gate, poster
-
-
-def test_background_chord_posts_paced_events_to_the_rdp_input_window_only():
-    nav, gate, poster = navigator()
-    r = nav.send_chord(TARGET, ("alt", "pageup"), 10.0, background=True)
-    assert r.ok and "background" in r.message
-    assert {h for h, *_ in poster.posts} == {INPUT_HWND}
-    assert poster.keys() == [
-        (w.WM_SYSKEYDOWN, 0x12, 0x38, False, True, False),   # Alt down
-        (w.WM_SYSKEYDOWN, 0x21, 0x49, True, True, False),    # Page Up down (Alt held)
-        (w.WM_SYSKEYUP, 0x21, 0x49, True, True, True),       # Page Up up (Alt held)
-        (w.WM_KEYUP, 0x12, 0x38, False, False, True),        # Alt up
-    ]
-    assert all(guard is None for guard, _fg in gate.calls)  # your local typing never blocks background input
-
-
-def test_background_shuffle_repeats_tab_while_alt_is_held():
-    nav, gate, poster = navigator()
-    assert nav.send_chord(TARGET, ("alt", "tab"), 10.0, repeat=2, pacing=PACING["slow"], background=True).ok
-    scans = [(scan, up) for _m, _vk, scan, _e, _a, up in poster.keys()]
-    assert scans == [(0x38, False), (0x0F, False), (0x0F, True), (0x0F, False), (0x0F, True), (0x38, True)]
-
-
-def test_background_chord_stops_and_releases_keys_when_you_switch_to_the_rdp_window():
-    gate = Gate()
-    gate.fail_from = 3  # initial check + Alt down pass; the RDP window becomes active before Page Up
-    nav, gate, poster = navigator(gate)
-    r = nav.send_chord(TARGET, ("alt", "pageup"), 10.0, background=True)
-    assert not r.ok and r.code == "now_foreground" and "keys released" in r.message
-    assert poster.keys() == [(w.WM_SYSKEYDOWN, 0x12, 0x38, False, True, False),
-                             (w.WM_KEYUP, 0x12, 0x38, False, False, True)]  # Alt released, Page Up never sent
-
-
-def test_background_chord_cancel_releases_keys():
-    nav, gate, poster = navigator()
-    cancel = threading.Event()
-    nav._sleep = lambda s: cancel.set()  # Pause pressed right after the first event
-    r = nav.send_chord(TARGET, ("alt", "pageup"), 10.0, cancel=cancel, background=True)
-    assert r.code == "cancelled"
-    downs = [k for k in poster.keys() if not k[5]]
-    ups = [k for k in poster.keys() if k[5]]
-    assert len(downs) == len(ups) == 1
-
-
-def test_background_chord_skipped_when_gate_refuses():
-    gate = Gate()
-    gate.fail_from = 1
-    nav, gate, poster = navigator(gate)
-    r = nav.send_chord(TARGET, ("pagedown",), 10.0, background=True)
-    assert not r.ok and r.message.startswith("Skipped") and poster.posts == []
-
-
-def test_foreground_path_is_unchanged_and_never_posts():
-    class FgGate(Gate):
-        def check_keyboard(self, target, guard):
-            return Verdict(False, "user_active", "You used the keyboard")
-
-    nav, gate, poster = navigator(FgGate())
-    r = nav.send_chord(TARGET, ("pagedown",), 10.0)
-    assert r.code == "user_active" and poster.posts == []
-
-
-# --- pointer --------------------------------------------------------------------------------
 
 def pointer(gate=None, cursor=(5000, 5000)):
     gate = gate or Gate()
@@ -229,25 +221,11 @@ def test_posted_glide_stops_when_rdp_becomes_active():
     assert out.result.code == "aborted" and poster.posts == []
 
 
-def test_posted_glide_skips_without_a_visible_area():
+def test_posted_glide_skips_without_a_visible_area_or_when_gate_refuses():
     pc, gate, poster = pointer()
     gate.inspector.size = None
-    out = pc.glide_posted(TARGET, 20, threading.Event())
-    assert out.result.code == "outside" and poster.posts == []
-
-
-def test_posted_wheel_scrolls_at_the_remote_pointer_position():
-    pc, gate, poster = pointer()
-    r = pc.wheel_posted(TARGET, down=True)
-    assert r.ok
-    (hwnd, msg, wparam, lparam), = poster.posts
-    assert hwnd == INPUT_HWND and msg == w.WM_MOUSEWHEEL
-    assert wparam == wheel_wparam(-3 * w.WHEEL_DELTA)
-    assert (lparam & 0xFFFF, lparam >> 16) == (400 + 100, 300 + 50)  # client centre -> screen
-
-
-def test_posted_wheel_respects_gate():
-    gate = Gate()
-    gate.fail_from = 1
-    pc, gate, poster = pointer(gate)
-    assert not pc.wheel_posted(TARGET, down=False).ok and poster.posts == []
+    assert pc.glide_posted(TARGET, 20, threading.Event()).result.code == "outside"
+    gate.inspector.size = (INPUT_HWND, 800, 600)
+    gate.refuse = True
+    assert pc.glide_posted(TARGET, 20, threading.Event()).result.code == "now_foreground"
+    assert poster.posts == []

@@ -97,3 +97,21 @@ def test_allowed_when_idle():
     t.now, t.last_input = 90_000, 10_000
     assert gate.check_keyboard(TARGET, 10).ok
     assert gate.check_pointer(TARGET, 10).ok
+
+
+def test_input_caused_by_bringing_rdp_forward_is_absorbed():
+    gate, ledger, ticks, clock = make()
+    ticks.last_input = ticks.now - 20_000  # you last touched the PC 20 s ago
+    gate.observe()
+    marker = gate.activity_marker()
+    ticks.now += 100
+    clock[0] += 0.1
+    ticks.last_input = ticks.now  # the RDP client injects key events as it gets focus
+    gate.absorb_input_since(marker)
+    gate.observe()
+    assert gate.activity_marker() == marker and not gate.user_active_within(1.0)
+    ticks.now += 50
+    clock[0] += 0.05
+    ticks.last_input = ticks.now  # then you touch the keyboard: that counts again
+    gate.observe()
+    assert gate.user_active_within(1.0)

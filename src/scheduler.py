@@ -11,9 +11,14 @@ Rules enforced here:
   When it becomes unavailable they are cancelled; when it returns they restart
   from the full interval (or wait for the user, per the resume policy).
   Missed actions are never sent late.
-* RDP window active  -> SendInput (the real keyboard/pointer path) with the idle guard.
-  RDP window inactive -> background mode: messages posted to the RDP window only;
-  your local apps, keyboard focus and mouse pointer are never touched.
+* Keys are only ever sent with SendInput while the RDP window is the active window,
+  and only at a short pause (no keyboard/mouse use for idle_guard_s, default 3 s).
+  A switch that is due waits for the first such pause (checked every retry_s); being busy
+  never restarts the whole countdown.
+  RDP window inactive -> background mode: when a switch is due and you have paused,
+  the RDP window is brought forward for a moment, the keys are sent, and the window
+  you were using gets focus back (focus_borrow.py).  The RDP client ignores keys
+  sent while it is in the background, so there is no way around the brief focus.
 * The real pointer is only moved while it rests over the active RDP window;
   otherwise only the remote pointer is moved (posted messages).
 * Pause/Stop cancel in-flight pointer glides and pending waits immediately.
@@ -38,11 +43,12 @@ from keyboard_navigation import (
     chord_text, remote_app_keys, scroll_key_for,
 )
 from pointer_controller import ManualMovementMonitor, PointerController
+from focus_borrow import Borrow, FocusBorrower
 from rdp_settings import HOOK_FULLSCREEN, HOOK_REMOTE, RdpKeyboardSettings, windows_keys_go_remote
 from screen_watch import SwitchWatcher
 from settings import Settings
 from window_detection import (
-    BACKGROUND, CLOSED, HIDDEN, MINIMIZED, NOT_FOREGROUND, REPLACED, RdpWindow, TargetStatus, WindowInspector, status,
+    BACKGROUND, CLOSED, MINIMIZED, NOT_FOREGROUND, REPLACED, RdpWindow, TargetStatus, WindowInspector, status,
 )
 
 log = logging.getLogger(__name__)
@@ -90,8 +96,8 @@ class EngineConfig:
     resume_policy: str = "auto"
     key_timing: str = "normal"      # "normal" | "slow" (see keyboard_navigation.PACING)
     background_input: bool = True   # keep working while the RDP window is not the active window
-    background_retry_s: float = 5.0  # background cycle skipped because you held a modifier: retry soon
-    idle_guard_s: float = 10.0      # no automated input within this long after real user input
+    retry_s: float = 1.0            # a due switch waiting for your pause is re-checked this often
+    idle_guard_s: float = 3.0       # switch only after this long without keyboard/mouse use (a short pause)
     pointer_rest_s: float = 3.0     # mouse must rest this long over the RDP window before arming
     action_gap_s: float = 0.5       # pause between the switch and the scroll action
     long_gap_s: float = 5.0         # a worker stall longer than this restarts countdowns
@@ -137,11 +143,16 @@ class Snapshot:
     cycles: int
     events: tuple[LogEntry, ...]
     switch_note: str = ""
+    switch_waiting: bool = False   # the app switch is due and waits for a short pause in your typing/mouse use
 
 
 _TERMINAL_TARGET_CODES = {CLOSED, REPLACED}
 # Codes that background mode can work around (the session itself is fine, it is just not in front).
-_BACKGROUND_CODES = {NOT_FOREGROUND, MINIMIZED, HIDDEN}
+# A window on another virtual desktop is not one of them: bringing it forward would switch desktops.
+_BACKGROUND_CODES = {NOT_FOREGROUND, MINIMIZED}
+# A background switch that could not happen for one of these momentary reasons is retried soon.
+_RETRY_SOON = {"held", "user_active", "focus_changed", "activate_failed", "locked", "screensaver"}
+ACTIVATE_RETRY_S = 60.0
 _POINTER_POSTED_DETAIL = "Moving only the remote pointer — your mouse is never touched"
 
 
@@ -150,8 +161,9 @@ class AutomationEngine:
                  pointer: PointerController, monitor: ManualMovementMonitor,
                  config: EngineConfig | None = None, clock=time.monotonic, cursor=None,
                  tick_s: float = 0.1, start_thread: bool = True, rdp_keys: RdpKeyboardSettings | None = None,
-                 screen_watcher: SwitchWatcher | None = None):
+                 screen_watcher: SwitchWatcher | None = None, focus: FocusBorrower | None = None):
         self.inspector = inspector
+        self.focus = focus or FocusBorrower(inspector)
         self.screen = screen_watcher or SwitchWatcher(inspector)
         self.rdp_keys = rdp_keys or RdpKeyboardSettings()
         # RDP windows where Alt+Tab was seen reaching the local computer: never use Alt+Tab there again.
@@ -194,6 +206,8 @@ class AutomationEngine:
         self._background = False       # RDP window valid but not the active window (background mode)
         self._manual_hold = False      # you took the real pointer: stays MANUAL until you resume it
         self._last_fail_code = ""
+        self._deferral_noted = False   # "app switch postponed" logged once per due switch
+        self._switch_waiting = False   # a due switch is waiting for your pause
 
         self._thread: threading.Thread | None = None
         if start_thread:
@@ -302,6 +316,7 @@ class AutomationEngine:
             self._unavailable = False
             self._needs_fresh = False
             self._manual_hold = False
+            self._switch_waiting = False
             self._set_pointer(PointerState.OFF if not self._cfg.pointer_enabled else PointerState.IDLE, "")
             self._detail = "Stopped"
         self._wake.set()
@@ -334,8 +349,8 @@ class AutomationEngine:
             self._test_cancel = threading.Event()
             self._test_until = self._clock() + self.TEST_TIMEOUT_S
             if self._cfg.background_input:
-                self._detail = "Test: sending one switch + scroll to the RDP window…"
-                self._log("info", "Test requested (works with the RDP window in the background)")
+                self._detail = "Test: keep still — the RDP window comes forward for a moment…"
+                self._log("info", "Test requested: keep still; the RDP window will come forward for a moment")
             else:
                 self._detail = "Test: click inside the RDP window, then keep still…"
                 self._log("info", "Test requested: click inside the RDP window and keep still")
@@ -377,6 +392,7 @@ class AutomationEngine:
                 cycles=self._cycles,
                 events=tuple(list(self._events)[-40:]),
                 switch_note=self._switch_note,
+                switch_waiting=self._switch_waiting and self._run == RunState.RUNNING and not self._unavailable,
             )
 
     def shutdown(self) -> None:
@@ -407,6 +423,8 @@ class AutomationEngine:
         self._hook_failed = False
         self._manual_hold = False
         self._background = False
+        self._deferral_noted = False
+        self._switch_waiting = False
         if self._cfg.pointer_enabled:
             self._set_pointer(PointerState.ARMING, "Rest the mouse over the RDP window to arm")
         self._detail = "Waiting for the RDP window to become active…"
@@ -455,7 +473,7 @@ class AutomationEngine:
         note = ""
         if target is not None and cfg.switch_shortcut in REMOTE_APP_SWITCHES and st is not None \
                 and st.code not in _TERMINAL_TARGET_CODES:
-            keys, why = self._remote_switch(target, cfg.switch_shortcut, background)
+            keys, why = self._remote_switch(target, cfg.switch_shortcut)
             note = f"App switching: {chord_text(keys)} ({why})"
         with self._lock:
             self._target_status = st
@@ -520,8 +538,8 @@ class AutomationEngine:
             self._background = background
             if background:
                 self._detail = "Running in the background"
-                self._log("info", "RDP window is in the background: input now goes straight to it "
-                                  "(your local apps, keyboard and mouse are not touched)")
+                self._log("info", "RDP window is in the background: app switches will bring it forward for "
+                                  "a moment once you pause, then return you to your window")
             else:
                 self._detail = "Running"
                 self._log("info", "RDP window is the active window: using normal input")
@@ -554,6 +572,8 @@ class AutomationEngine:
         with self._lock:
             now = self._clock()
             self._needs_fresh = False
+            self._switch_waiting = False
+            self._deferral_noted = False
             self._kb_due = now + cfg.interval_s if cfg.keyboard_enabled else None
             if cfg.pointer_enabled and self._ptr_state in (PointerState.SUSPENDED, PointerState.IDLE,
                                                            PointerState.ARMING, PointerState.ACTIVE,
@@ -623,7 +643,7 @@ class AutomationEngine:
             return
         background = st.code == BACKGROUND
         since = self.gate.seconds_since_user_activity()
-        if not background and since is not None and since < self.TEST_REST_S:
+        if since is not None and since < self.TEST_REST_S:
             with self._lock:
                 self._detail = "Test: keep still for a moment…"
             return
@@ -645,13 +665,8 @@ class AutomationEngine:
         with self._lock:
             self._log("info" if sent else "warning", "Test finished" if sent else "Test sent nothing (see above)")
 
-    def _remote_switch(self, target: RdpWindow, switch_id: str,
-                       background: bool = False) -> tuple[tuple[str, ...], str]:
+    def _remote_switch(self, target: RdpWindow, switch_id: str) -> tuple[tuple[str, ...], str]:
         """Pick the app-switch keys the RDP client will actually forward to the remote session."""
-        if background:
-            # Without focus the client's Windows-key hook is not active, so its own stand-in is used.
-            return (remote_app_keys(switch_id, False),
-                    "RDP window in the background: Alt+Page Up is Remote Desktop's own Alt+Tab for the remote PC")
         info = self.rdp_keys.lookup(target.pid, target.process_name)
         fullscreen = self.inspector.is_fullscreen(target)
         remote = windows_keys_go_remote(info.mode, fullscreen) and target.hwnd not in self._alt_tab_unsafe
@@ -668,88 +683,150 @@ class AutomationEngine:
 
     def _keyboard_cycle(self, target: RdpWindow, cfg: EngineConfig, cancel: threading.Event | None = None,
                         background: bool = False) -> bool:
+        """One switch + one scroll.
+
+        RDP window in front: switch, wait until the new app is on screen, then scroll it.
+        Background mode: once you have left the keyboard and mouse alone for idle_guard_s, the RDP
+        window is brought forward, the app showing now is scrolled and then the switch is sent with no
+        waiting (so the window is in front for well under a second), and the window you were using gets
+        focus back.  The keys always go through the normal foreground path with its per-key checks.
+        """
         cancel = cancel or self._cancel
         pacing = PACING.get(cfg.key_timing, PACING["normal"])
         switch = SWITCH_SHORTCUTS.get(cfg.switch_shortcut, SWITCH_SHORTCUTS["off"])
-        sent_any = False
         scrolling = cfg.scroll_key != "off"
-        area = before = None
+        sent_any = False
         self._last_fail_code = ""
+        borrow: Borrow | None = None
+        suspend = not background  # a focus change during a borrowed moment just postpones the switch
         try:
-            if switch.keys:
+            if cancel.is_set() or not self._ready_to_switch(cfg):
+                return sent_any
+            if background:
+                borrow = self._bring_forward(target)
+                if borrow is None:
+                    return sent_any
+            area = before = None
+            if not background and switch.keys and scrolling:
+                # Remember the screen so we can tell when the switched-to app has appeared.
+                area = self.inspector.input_area(target)
+                before = self.screen.snapshot(area)
+            for step in (("scroll", "switch") if background else ("switch", "scroll")):
                 if cancel.is_set():
                     return sent_any
-                if scrolling and not background:
-                    # Remember the screen so we can tell when the switched-to app has appeared.  (In the
-                    # background the window may be covered or minimized: a fixed wait is used instead.)
-                    area = self.inspector.input_area(target)
-                    before = self.screen.snapshot(area)
-                keys, why = switch.keys, ""
-                if switch.id in REMOTE_APP_SWITCHES:
-                    keys, why = self._remote_switch(target, switch.id, background)
-                steps = 1
-                shuffler = self._shuffler_for(cfg) if switch.id == SHUFFLE_APPS else None
-                if shuffler is not None:
-                    _app, steps = shuffler.peek()
-                r = self.keyboard.send_chord(target, keys, cfg.idle_guard_s, repeat=steps, pacing=pacing,
-                                             cancel=cancel, background=background)
-                if r.ok and switch.id in REMOTE_APP_SWITCHES:
-                    if shuffler is not None:
-                        shuffler.commit()
-                    took = r.message.rsplit(" over ", 1)[-1] if " over " in r.message else ""
-                    order = (f"; shuffled order of {cfg.app_count}" if shuffler is not None else
-                             "; cycling through all open apps" if switch.id in (CYCLE_APPS, "alt_pagedown") else "")
-                    r = ActionResult(True, "ok", f"Switched remote app with {chord_text(keys, steps)}"
-                                                 f"{' over ' + took if took else ''} ({why}{order})")
-                elif r.code == "focus_changed" and "tab" in keys and "alt" in keys and not background:
-                    # Alt+Tab may have reached the local computer: never use it for this window again.
-                    self._alt_tab_unsafe.add(target.hwnd)
-                    r = ActionResult(False, r.code, r.message + " — Alt+Tab may have reached this computer, so "
-                                                                "this RDP window will use Alt+Page Up from now on")
-                if not self._record(r):
-                    return sent_any
-                sent_any = True
-
-            down = self._scroll_down_next if cfg.scroll_direction == "alternate" else cfg.scroll_direction == "down"
-            wheel = cfg.scroll_key == "wheel"
-            key = scroll_key_for(cfg.scroll_key, down) if scrolling and not wheel else None
-            if key or wheel:
-                if sent_any:
-                    # Scroll the app we switched to, not the old one: wait until it has appeared on screen.
-                    seen, waited = self.screen.wait_for_switch(area, before, cancel)
-                    if cancel.is_set():
-                        return sent_any
-                    with self._lock:
-                        self._log("info", f"New app appeared after {waited:.1f} s; scrolling it now" if seen else
-                                          f"No visible change after {waited:.1f} s; scrolling anyway")
-                if cancel.is_set():
-                    return sent_any
-                if wheel:
-                    r = (self.pointer.wheel_posted(target, down) if background
-                         else self.pointer.wheel(target, down, cfg.idle_guard_s))
+                if step == "switch":
+                    if not switch.keys:
+                        continue
+                    r = self._send_switch(target, cfg, switch, pacing, cancel)
                 else:
-                    r = self.keyboard.send_chord(target, (key,), cfg.idle_guard_s, pacing=pacing, cancel=cancel,
-                                                 background=background)
-                if not self._record(r):
+                    if not scrolling:
+                        continue
+                    if sent_any and not background:
+                        # Scroll the app we switched to, not the old one: wait until it has appeared.
+                        seen, waited = self.screen.wait_for_switch(area, before, cancel)
+                        if cancel.is_set():
+                            return sent_any
+                        with self._lock:
+                            self._log("info", f"New app appeared after {waited:.1f} s; scrolling it now" if seen
+                                      else f"No visible change after {waited:.1f} s; scrolling anyway")
+                    r = self._send_scroll(target, cfg, pacing, cancel)
+                if not self._record(r, suspend):
                     return sent_any
                 sent_any = True
-                if cfg.scroll_direction == "alternate":
+                if step == "scroll" and cfg.scroll_direction == "alternate":
                     self._scroll_down_next = not self._scroll_down_next
         finally:
+            if borrow is not None:
+                self.focus.give_back(target, borrow)
+                with self._lock:
+                    self._log("info", "Gave focus back to the window you were using")
             with self._lock:
                 if self._run == RunState.RUNNING and not self._unavailable and cfg.keyboard_enabled:
                     now = self._clock()
-                    # In the background a modifier you happened to hold is momentary: try again shortly
-                    # instead of waiting a whole interval.
-                    retry = background and not sent_any and self._last_fail_code == "held"
-                    self._kb_due = now + (cfg.background_retry_s if retry else cfg.interval_s)
+                    code = self._last_fail_code
+                    if not sent_any and code in _RETRY_SOON:  # you were busy: try again at your next pause
+                        delay = ACTIVATE_RETRY_S if code == "activate_failed" else cfg.retry_s
+                    else:
+                        delay = cfg.interval_s
+                    self._kb_due = now + delay
                     if self._ptr_due is not None and self._ptr_due < now + 2:
                         self._ptr_due = now + 2  # keep pointer moves clear of key presses
                 if sent_any:
                     self._cycles += 1
+                    self._deferral_noted = False
+                    self._switch_waiting = False
         return sent_any
 
-    def _record(self, r: ActionResult) -> bool:
+    def _send_switch(self, target: RdpWindow, cfg: EngineConfig, switch, pacing, cancel) -> ActionResult:
+        keys, why = switch.keys, ""
+        if switch.id in REMOTE_APP_SWITCHES:
+            keys, why = self._remote_switch(target, switch.id)
+        steps = 1
+        shuffler = self._shuffler_for(cfg) if switch.id == SHUFFLE_APPS else None
+        if shuffler is not None:
+            _app, steps = shuffler.peek()
+        r = self.keyboard.send_chord(target, keys, cfg.idle_guard_s, repeat=steps, pacing=pacing, cancel=cancel)
+        if r.ok and switch.id in REMOTE_APP_SWITCHES:
+            if shuffler is not None:
+                shuffler.commit()
+            took = r.message.rsplit(" over ", 1)[-1] if " over " in r.message else ""
+            order = (f"; shuffled order of {cfg.app_count}" if shuffler is not None else
+                     "; cycling through all open apps" if switch.id in (CYCLE_APPS, "alt_pagedown") else "")
+            return ActionResult(True, "ok", f"Switched remote app with {chord_text(keys, steps)}"
+                                            f"{' over ' + took if took else ''} ({why}{order})")
+        if r.code == "focus_changed" and "tab" in keys and "alt" in keys:
+            # Alt+Tab may have reached the local computer: never use it for this window again.
+            self._alt_tab_unsafe.add(target.hwnd)
+            return ActionResult(False, r.code, r.message + " — Alt+Tab may have reached this computer, so "
+                                                           "this RDP window will use Alt+Page Up from now on")
+        return r
+
+    def _send_scroll(self, target: RdpWindow, cfg: EngineConfig, pacing, cancel) -> ActionResult:
+        down = self._scroll_down_next if cfg.scroll_direction == "alternate" else cfg.scroll_direction == "down"
+        if cfg.scroll_key == "wheel":
+            return self.pointer.wheel(target, down, cfg.idle_guard_s)
+        return self.keyboard.send_chord(target, (scroll_key_for(cfg.scroll_key, down),), cfg.idle_guard_s,
+                                        pacing=pacing, cancel=cancel)
+
+    def _ready_to_switch(self, cfg: EngineConfig) -> bool:
+        """A due switch waits for a short pause: no key or button held, no keyboard/mouse use for
+        idle_guard_s, and the PC unlocked.  Otherwise it is postponed and re-checked every retry_s."""
+        held = self.gate.held_keys() + self.gate.held_buttons()
+        if held:
+            return self._defer("held", f"waiting until you release {', '.join(held)}")
+        self.gate.observe()
+        if self.gate.user_active_within(cfg.idle_guard_s):
+            return self._defer("user_active", f"waiting for a {cfg.idle_guard_s:g}-second pause in your "
+                                              "typing and mouse use")
+        session = self.gate.session_verdict()
+        if not session.ok:
+            return self._defer(session.code, session.message)
+        return True
+
+    def _bring_forward(self, target: RdpWindow) -> Borrow | None:
+        """Background mode: make the RDP window the active window for a moment."""
+        marker = self.gate.activity_marker()
+        borrow = self.focus.bring_forward(target)
+        if not borrow.ok:
+            self._defer("activate_failed", f"{borrow.message}; trying again in a minute")
+            return None  # never send keys unless the RDP window really is in front
+        # The RDP client injects a couple of key events as it gets focus: that is not you typing.
+        self.gate.absorb_input_since(marker)
+        with self._lock:
+            self._log("info", "Brought the RDP window forward for a moment to switch apps")
+        return borrow
+
+    def _defer(self, code: str, why: str) -> bool:
+        with self._lock:
+            self._last_fail_code = code
+            self._switch_waiting = True
+            self._detail = f"App switch due: {why}"
+            if not self._deferral_noted:
+                self._deferral_noted = True
+                self._log("info", f"App switch due, {why}")
+        return False
+
+    def _record(self, r: ActionResult, suspend: bool = True) -> bool:
         with self._lock:
             if r.ok:
                 self._log("info", r.message)
@@ -758,7 +835,7 @@ class AutomationEngine:
             self._last_fail_code = r.code
             self._log("warning", r.message)
             self._detail = r.message
-        if r.code == "focus_changed":
+        if r.code == "focus_changed" and suspend:
             self._enter_unavailable("Focus changed while a shortcut was being sent")
         return False
 
