@@ -45,6 +45,7 @@ class Settings:
     pointer_range_px: int = 20
     resume_policy: str = "auto"
     key_timing: str = "normal"
+    background_input: bool = True  # keep the session active while you use other apps
     minimize_to: str = "taskbar"
     always_on_top: bool = True
     expanded: bool = False
@@ -60,7 +61,7 @@ def _num(value, default, lo, hi, cast):
         if isinstance(value, bool):
             raise TypeError
         v = cast(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(Infinity) from a hand-edited file
         return default
     if v != v:  # NaN
         return default
@@ -109,6 +110,7 @@ def validate(raw: dict) -> Settings:
                               POINTER_RANGE_MAX, int),
         resume_policy=_choice(raw.get("resume_policy"), d.resume_policy, RESUME_POLICIES),
         key_timing=_choice(raw.get("key_timing"), d.key_timing, KEY_TIMINGS),
+        background_input=_flag(raw.get("background_input"), d.background_input),
         minimize_to=_choice(raw.get("minimize_to"), d.minimize_to, MINIMIZE_TARGETS),
         always_on_top=_flag(raw.get("always_on_top"), d.always_on_top),
         expanded=_flag(raw.get("expanded"), d.expanded),

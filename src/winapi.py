@@ -1,9 +1,11 @@
 """Minimal ctypes bindings for the documented Win32 APIs RDP Nexus relies on.
 
 Only user32 / kernel32 / dwmapi functions are used, every one of them with
-explicit argtypes/restype so 64-bit handles are never truncated.  Input is
-injected exclusively through SendInput (the documented, foreground-routed
-input path).  Nothing here posts or sends window messages to other processes.
+explicit argtypes/restype so 64-bit handles are never truncated.  Input for the
+active window goes through SendInput (the documented, foreground-routed input
+path).  The only window messages posted to another process are the keyboard and
+mouse messages of background mode, and only to the selected RDP window's input
+window (see background_input.py).
 """
 
 from __future__ import annotations
@@ -41,6 +43,10 @@ HC_ACTION = 0
 LLMHF_INJECTED = 0x00000001
 
 WM_QUIT = 0x0012
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 WM_MOUSEMOVE = 0x0200
 WM_MOUSEWHEEL = 0x020A
 WM_MOUSEHWHEEL = 0x020E
@@ -191,6 +197,8 @@ PeekMessageW = _bind(user32, "PeekMessageW", wintypes.BOOL, ctypes.POINTER(winty
                      wintypes.UINT, wintypes.UINT, wintypes.UINT)
 PostThreadMessageW = _bind(user32, "PostThreadMessageW", wintypes.BOOL, wintypes.DWORD, wintypes.UINT,
                            wintypes.WPARAM, wintypes.LPARAM)
+PostMessageW = _bind(user32, "PostMessageW", wintypes.BOOL, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                     wintypes.LPARAM)
 OpenInputDesktop = _bind(user32, "OpenInputDesktop", HDESK, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
 CloseDesktop = _bind(user32, "CloseDesktop", wintypes.BOOL, HDESK)
 GetUserObjectInformationW = _bind(user32, "GetUserObjectInformationW", wintypes.BOOL, wintypes.HANDLE,
@@ -268,6 +276,11 @@ def virtual_screen() -> tuple[int, int, int, int]:
         GetSystemMetrics(SM_CXVIRTUALSCREEN),
         GetSystemMetrics(SM_CYVIRTUALSCREEN),
     )
+
+
+def post_message(hwnd: int, msg: int, wparam: int, lparam: int) -> bool:
+    """PostMessage with an lParam built as an unsigned 32-bit value (works on 32- and 64-bit Python)."""
+    return bool(PostMessageW(hwnd, msg, wparam & 0xFFFFFFFF, ctypes.c_ssize_t(lparam & 0xFFFFFFFF).value))
 
 
 def send_inputs(inputs: list[INPUT]) -> int:

@@ -114,7 +114,9 @@ def main() -> int:
         raise SystemExit(f"Tag version {args.expect_version} does not match APP_VERSION {version}")
     print(f"Building RDP Nexus {version}")
 
-    if not args.skip_tests and os.path.isdir(os.path.join(ROOT, "tests")):
+    if not args.skip_tests:
+        if not os.path.isdir(os.path.join(ROOT, "tests")):
+            raise SystemExit("tests/ folder not found: restore it, or pass --skip-tests to build without tests")
         run([sys.executable, "-m", "pytest", "-q"])
 
     for folder in (DIST, RELEASE):

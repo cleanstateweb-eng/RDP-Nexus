@@ -184,5 +184,34 @@ class SafetyGate:
             return Verdict(False, "user_active", f"You used the keyboard or mouse in the last {idle_guard_s:.0f} s")
         return ALLOWED
 
+    def check_background(self, target: RdpWindow | None, idle_guard_s: float | None = None,
+                         allow_foreground: bool = False) -> Verdict:
+        """Gate for background mode (messages posted to the RDP window; nothing else is touched).
+
+        Posted input only ever reaches the RDP window, so your use of local apps does not block
+        it (no idle guard unless one is given).  It still fails closed when the window is gone,
+        hung, showing a dialog or disconnected, when this computer is locked, and while you hold
+        Shift/Ctrl/Alt/Win.  Unless `allow_foreground`, it also stops as soon as the RDP window
+        becomes the active window: from then on you may be typing into it, and the normal
+        (SendInput) path with its idle guard takes over.
+        """
+        st = self.inspector.check(target, require_foreground=False, allow_background=True)
+        if not st.ok:
+            return Verdict(False, st.code, st.message)
+        if not allow_foreground and self.inspector.is_foreground(target):
+            return Verdict(False, "now_foreground", "the RDP window became the active window")
+        v = self.session_verdict()
+        if not v.ok:
+            return v
+        held = self.held_keys()
+        if held:
+            return Verdict(False, "held", f"{', '.join(held)} is held down")
+        if idle_guard_s is not None:
+            self.observe()
+            if self.user_active_within(idle_guard_s):
+                return Verdict(False, "user_active",
+                               f"You used the keyboard or mouse in the last {idle_guard_s:.0f} s")
+        return ALLOWED
+
     def still_foreground(self, target: RdpWindow) -> bool:
         return self.inspector.is_foreground(target)

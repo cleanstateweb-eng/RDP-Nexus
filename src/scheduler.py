@@ -6,13 +6,19 @@ GUI thread is never blocked.
 
 Rules enforced here:
 * Exactly one worker thread exists; Start while running is a no-op.
-* Countdowns only run while the RDP target is valid and in the foreground.
+* Countdowns only run while the RDP target is valid: in the foreground, or (in
+  background mode, the default) anywhere as long as the session is connected.
   When it becomes unavailable they are cancelled; when it returns they restart
   from the full interval (or wait for the user, per the resume policy).
   Missed actions are never sent late.
+* RDP window active  -> SendInput (the real keyboard/pointer path) with the idle guard.
+  RDP window inactive -> background mode: messages posted to the RDP window only;
+  your local apps, keyboard focus and mouse pointer are never touched.
+* The real pointer is only moved while it rests over the active RDP window;
+  otherwise only the remote pointer is moved (posted messages).
 * Pause/Stop cancel in-flight pointer glides and pending waits immediately.
 * Manual pointer movement moves the pointer feature to MANUAL; only an explicit
-  user command (Resume pointer / Resume / Start) re-arms it.
+  user command (Resume pointer / Resume / Start) re-arms the real-pointer glides.
 """
 
 from __future__ import annotations
@@ -35,7 +41,9 @@ from pointer_controller import ManualMovementMonitor, PointerController
 from rdp_settings import HOOK_FULLSCREEN, HOOK_REMOTE, RdpKeyboardSettings, windows_keys_go_remote
 from screen_watch import SwitchWatcher
 from settings import Settings
-from window_detection import CLOSED, REPLACED, RdpWindow, TargetStatus, WindowInspector
+from window_detection import (
+    BACKGROUND, CLOSED, HIDDEN, MINIMIZED, NOT_FOREGROUND, REPLACED, RdpWindow, TargetStatus, WindowInspector, status,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +57,12 @@ class RunState(Enum):
 class DisplayState(str, Enum):
     STOPPED = "Stopped"
     RUNNING = "Running"
+    BACKGROUND = "Running in background"
     PAUSED = "Paused"
     UNAVAILABLE = "RDP Unavailable"
+
+
+ACTIVE_STATES = (DisplayState.RUNNING, DisplayState.BACKGROUND, DisplayState.UNAVAILABLE)
 
 
 class PointerState(str, Enum):
@@ -58,6 +70,7 @@ class PointerState(str, Enum):
     IDLE = "Idle"
     ARMING = "Arming"
     ACTIVE = "Active"
+    BACKGROUND = "Background"   # moving only the remote pointer (posted messages)
     SUSPENDED = "Suspended"
     MANUAL = "Manual control"
     FAULT = "Disabled (safety)"
@@ -76,6 +89,8 @@ class EngineConfig:
     pointer_range_px: int = 20
     resume_policy: str = "auto"
     key_timing: str = "normal"      # "normal" | "slow" (see keyboard_navigation.PACING)
+    background_input: bool = True   # keep working while the RDP window is not the active window
+    background_retry_s: float = 5.0  # background cycle skipped because you held a modifier: retry soon
     idle_guard_s: float = 10.0      # no automated input within this long after real user input
     pointer_rest_s: float = 3.0     # mouse must rest this long over the RDP window before arming
     action_gap_s: float = 0.5       # pause between the switch and the scroll action
@@ -95,6 +110,7 @@ class EngineConfig:
             pointer_range_px=s.pointer_range_px,
             resume_policy=s.resume_policy,
             key_timing=s.key_timing,
+            background_input=s.background_input,
         )
         return replace(cfg, **overrides) if overrides else cfg
 
@@ -124,6 +140,9 @@ class Snapshot:
 
 
 _TERMINAL_TARGET_CODES = {CLOSED, REPLACED}
+# Codes that background mode can work around (the session itself is fine, it is just not in front).
+_BACKGROUND_CODES = {NOT_FOREGROUND, MINIMIZED, HIDDEN}
+_POINTER_POSTED_DETAIL = "Moving only the remote pointer — your mouse is never touched"
 
 
 class AutomationEngine:
@@ -172,6 +191,9 @@ class AutomationEngine:
         self._test_until: float | None = None
         self._test_running = False
         self._test_cancel = threading.Event()
+        self._background = False       # RDP window valid but not the active window (background mode)
+        self._manual_hold = False      # you took the real pointer: stays MANUAL until you resume it
+        self._last_fail_code = ""
 
         self._thread: threading.Thread | None = None
         if start_thread:
@@ -235,7 +257,8 @@ class AutomationEngine:
                 self._detail = "Select your RDP window first"
                 self._log("warning", self._detail)
                 return False
-            st = self.inspector.check(self._target, require_foreground=False)
+            st = self.inspector.check(self._target, require_foreground=False,
+                                      allow_background=self._cfg.background_input)
             if not st.ok:
                 self._detail = f"Cannot start: {st.message}"
                 self._log("warning", self._detail)
@@ -278,6 +301,7 @@ class AutomationEngine:
             self._kb_due = None
             self._unavailable = False
             self._needs_fresh = False
+            self._manual_hold = False
             self._set_pointer(PointerState.OFF if not self._cfg.pointer_enabled else PointerState.IDLE, "")
             self._detail = "Stopped"
         self._wake.set()
@@ -286,6 +310,7 @@ class AutomationEngine:
         with self._lock:
             if not self._cfg.pointer_enabled:
                 return
+            self._manual_hold = False
             if self._ptr_state in (PointerState.MANUAL, PointerState.FAULT, PointerState.IDLE):
                 self._hook_failed = False
                 if self._run == RunState.RUNNING:
@@ -308,8 +333,12 @@ class AutomationEngine:
                 return False
             self._test_cancel = threading.Event()
             self._test_until = self._clock() + self.TEST_TIMEOUT_S
-            self._detail = "Test: click inside the RDP window, then keep still…"
-            self._log("info", "Test requested: click inside the RDP window and keep still")
+            if self._cfg.background_input:
+                self._detail = "Test: sending one switch + scroll to the RDP window…"
+                self._log("info", "Test requested (works with the RDP window in the background)")
+            else:
+                self._detail = "Test: click inside the RDP window, then keep still…"
+                self._log("info", "Test requested: click inside the RDP window and keep still")
         self._wake.set()
         return True
 
@@ -327,6 +356,8 @@ class AutomationEngine:
                 state = DisplayState.PAUSED
             elif self._unavailable:
                 state = DisplayState.UNAVAILABLE
+            elif self._background:
+                state = DisplayState.BACKGROUND
             else:
                 state = DisplayState.RUNNING
             return Snapshot(
@@ -338,7 +369,8 @@ class AutomationEngine:
                 pointer_state=self._ptr_state,
                 pointer_detail=self._ptr_detail,
                 pointer_countdown_s=(max(0.0, self._ptr_due - now)
-                                     if self._ptr_due is not None and self._ptr_state == PointerState.ACTIVE
+                                     if self._ptr_due is not None
+                                     and self._ptr_state in (PointerState.ACTIVE, PointerState.BACKGROUND)
                                      else None),
                 target=self._target,
                 target_status=self._target_status,
@@ -373,6 +405,8 @@ class AutomationEngine:
         self._needs_fresh = True
         self._kb_due = None
         self._hook_failed = False
+        self._manual_hold = False
+        self._background = False
         if self._cfg.pointer_enabled:
             self._set_pointer(PointerState.ARMING, "Rest the mouse over the RDP window to arm")
         self._detail = "Waiting for the RDP window to become active…"
@@ -416,11 +450,12 @@ class AutomationEngine:
 
         with self._lock:
             run, cfg, target = self._run, self._cfg, self._target
-        st = self.inspector.check(target, require_foreground=True) if target is not None else None
+        st = self._target_status_for(target, cfg)
+        background = st is not None and st.code == BACKGROUND
         note = ""
         if target is not None and cfg.switch_shortcut in REMOTE_APP_SWITCHES and st is not None \
                 and st.code not in _TERMINAL_TARGET_CODES:
-            keys, why = self._remote_switch(target, cfg.switch_shortcut)
+            keys, why = self._remote_switch(target, cfg.switch_shortcut, background)
             note = f"App switching: {chord_text(keys)} ({why})"
         with self._lock:
             self._target_status = st
@@ -459,22 +494,43 @@ class AutomationEngine:
         if self._unavailable and not self._leave_unavailable(cfg):
             return
         if self._needs_fresh:
-            self._fresh_start(cfg)
+            self._fresh_start(cfg, background)
+        self._note_mode(background)
 
         self._detect_manual()
         if cfg.keyboard_enabled and self._kb_due is not None and self._clock() >= self._kb_due:
-            self._keyboard_cycle(target, cfg)
-        self._pointer_tick(target, cfg)
+            self._keyboard_cycle(target, cfg, background=background)
+        self._pointer_tick(target, cfg, background)
 
     # -- availability --------------------------------------------------------------
+    def _target_status_for(self, target: RdpWindow | None, cfg: EngineConfig) -> TargetStatus | None:
+        """Foreground check first; in background mode a connected-but-inactive window is BACKGROUND."""
+        if target is None:
+            return None
+        st = self.inspector.check(target, require_foreground=True)
+        if cfg.background_input and st.code in _BACKGROUND_CODES:
+            bg = self.inspector.check(target, require_foreground=False, allow_background=True)
+            return status(BACKGROUND) if bg.ok else bg
+        return st
+
+    def _note_mode(self, background: bool) -> None:
+        with self._lock:
+            if background == self._background:
+                return
+            self._background = background
+            if background:
+                self._detail = "Running in the background"
+                self._log("info", "RDP window is in the background: input now goes straight to it "
+                                  "(your local apps, keyboard and mouse are not touched)")
+            else:
+                self._detail = "Running"
+                self._log("info", "RDP window is the active window: using normal input")
     def _enter_unavailable(self, reason: str) -> None:
         with self._lock:
             if not self._unavailable:
                 self._unavailable = True
                 self._kb_due = None
-                if self._ptr_state == PointerState.ACTIVE:
-                    self._set_pointer(PointerState.SUSPENDED, reason)
-                elif self._ptr_state == PointerState.ARMING:
+                if self._ptr_state in (PointerState.ACTIVE, PointerState.ARMING, PointerState.BACKGROUND):
                     self._set_pointer(PointerState.SUSPENDED, reason)
                 self._log("warning", f"Automation suspended: {reason}")
             self._detail = reason
@@ -494,15 +550,16 @@ class AutomationEngine:
             self._log("info", "RDP window is active again — countdown restarted (missed actions are not sent)")
             return True
 
-    def _fresh_start(self, cfg: EngineConfig) -> None:
+    def _fresh_start(self, cfg: EngineConfig, background: bool = False) -> None:
         with self._lock:
             now = self._clock()
             self._needs_fresh = False
             self._kb_due = now + cfg.interval_s if cfg.keyboard_enabled else None
             if cfg.pointer_enabled and self._ptr_state in (PointerState.SUSPENDED, PointerState.IDLE,
-                                                           PointerState.ARMING, PointerState.ACTIVE):
+                                                           PointerState.ARMING, PointerState.ACTIVE,
+                                                           PointerState.BACKGROUND):
                 self._set_pointer(PointerState.ARMING, "Rest the mouse over the RDP window to arm")
-            self._detail = "Running"
+            self._detail = "Running in the background" if background else "Running"
 
     # -- hook / manual detection ---------------------------------------------------------
     def _manage_hook(self, run: RunState, cfg: EngineConfig) -> None:
@@ -535,6 +592,7 @@ class AutomationEngine:
 
     def _go_manual(self, reason: str) -> None:
         self.gate.mark_user_activity()
+        self._manual_hold = True
         self._set_pointer(PointerState.MANUAL,
                           f"You took control ({reason}) — pointer movement paused until you resume it")
         self._log("info", f"Manual pointer control detected ({reason}); pointer movement paused")
@@ -563,8 +621,9 @@ class AutomationEngine:
             with self._lock:
                 self._detail = f"Test waiting: {session.message}"
             return
+        background = st.code == BACKGROUND
         since = self.gate.seconds_since_user_activity()
-        if since is not None and since < self.TEST_REST_S:
+        if not background and since is not None and since < self.TEST_REST_S:
             with self._lock:
                 self._detail = "Test: keep still for a moment…"
             return
@@ -579,15 +638,20 @@ class AutomationEngine:
             cancel = self._test_cancel
             self._log("info", "Test running")
         try:
-            sent = self._keyboard_cycle(target, replace(cfg, idle_guard_s=1.0), cancel)
+            sent = self._keyboard_cycle(target, replace(cfg, idle_guard_s=1.0), cancel, background=background)
         finally:
             with self._lock:
                 self._test_running = False
         with self._lock:
             self._log("info" if sent else "warning", "Test finished" if sent else "Test sent nothing (see above)")
 
-    def _remote_switch(self, target: RdpWindow, switch_id: str) -> tuple[tuple[str, ...], str]:
+    def _remote_switch(self, target: RdpWindow, switch_id: str,
+                       background: bool = False) -> tuple[tuple[str, ...], str]:
         """Pick the app-switch keys the RDP client will actually forward to the remote session."""
+        if background:
+            # Without focus the client's Windows-key hook is not active, so its own stand-in is used.
+            return (remote_app_keys(switch_id, False),
+                    "RDP window in the background: Alt+Page Up is Remote Desktop's own Alt+Tab for the remote PC")
         info = self.rdp_keys.lookup(target.pid, target.process_name)
         fullscreen = self.inspector.is_fullscreen(target)
         remote = windows_keys_go_remote(info.mode, fullscreen) and target.hwnd not in self._alt_tab_unsafe
@@ -602,29 +666,33 @@ class AutomationEngine:
             why = "RDP keeps Windows key combinations on this computer: Alt+Page Up is its remote Alt+Tab"
         return remote_app_keys(switch_id, remote), why
 
-    def _keyboard_cycle(self, target: RdpWindow, cfg: EngineConfig, cancel: threading.Event | None = None) -> bool:
+    def _keyboard_cycle(self, target: RdpWindow, cfg: EngineConfig, cancel: threading.Event | None = None,
+                        background: bool = False) -> bool:
         cancel = cancel or self._cancel
         pacing = PACING.get(cfg.key_timing, PACING["normal"])
         switch = SWITCH_SHORTCUTS.get(cfg.switch_shortcut, SWITCH_SHORTCUTS["off"])
         sent_any = False
         scrolling = cfg.scroll_key != "off"
         area = before = None
+        self._last_fail_code = ""
         try:
             if switch.keys:
                 if cancel.is_set():
                     return sent_any
-                if scrolling:  # remember the screen so we can tell when the switched-to app has appeared
+                if scrolling and not background:
+                    # Remember the screen so we can tell when the switched-to app has appeared.  (In the
+                    # background the window may be covered or minimized: a fixed wait is used instead.)
                     area = self.inspector.input_area(target)
                     before = self.screen.snapshot(area)
                 keys, why = switch.keys, ""
                 if switch.id in REMOTE_APP_SWITCHES:
-                    keys, why = self._remote_switch(target, switch.id)
+                    keys, why = self._remote_switch(target, switch.id, background)
                 steps = 1
                 shuffler = self._shuffler_for(cfg) if switch.id == SHUFFLE_APPS else None
                 if shuffler is not None:
                     _app, steps = shuffler.peek()
                 r = self.keyboard.send_chord(target, keys, cfg.idle_guard_s, repeat=steps, pacing=pacing,
-                                             cancel=cancel)
+                                             cancel=cancel, background=background)
                 if r.ok and switch.id in REMOTE_APP_SWITCHES:
                     if shuffler is not None:
                         shuffler.commit()
@@ -633,7 +701,7 @@ class AutomationEngine:
                              "; cycling through all open apps" if switch.id in (CYCLE_APPS, "alt_pagedown") else "")
                     r = ActionResult(True, "ok", f"Switched remote app with {chord_text(keys, steps)}"
                                                  f"{' over ' + took if took else ''} ({why}{order})")
-                elif r.code == "focus_changed" and "tab" in keys and "alt" in keys:
+                elif r.code == "focus_changed" and "tab" in keys and "alt" in keys and not background:
                     # Alt+Tab may have reached the local computer: never use it for this window again.
                     self._alt_tab_unsafe.add(target.hwnd)
                     r = ActionResult(False, r.code, r.message + " — Alt+Tab may have reached this computer, so "
@@ -657,9 +725,11 @@ class AutomationEngine:
                 if cancel.is_set():
                     return sent_any
                 if wheel:
-                    r = self.pointer.wheel(target, down, cfg.idle_guard_s)
+                    r = (self.pointer.wheel_posted(target, down) if background
+                         else self.pointer.wheel(target, down, cfg.idle_guard_s))
                 else:
-                    r = self.keyboard.send_chord(target, (key,), cfg.idle_guard_s, pacing=pacing, cancel=cancel)
+                    r = self.keyboard.send_chord(target, (key,), cfg.idle_guard_s, pacing=pacing, cancel=cancel,
+                                                 background=background)
                 if not self._record(r):
                     return sent_any
                 sent_any = True
@@ -669,7 +739,10 @@ class AutomationEngine:
             with self._lock:
                 if self._run == RunState.RUNNING and not self._unavailable and cfg.keyboard_enabled:
                     now = self._clock()
-                    self._kb_due = now + cfg.interval_s
+                    # In the background a modifier you happened to hold is momentary: try again shortly
+                    # instead of waiting a whole interval.
+                    retry = background and not sent_any and self._last_fail_code == "held"
+                    self._kb_due = now + (cfg.background_retry_s if retry else cfg.interval_s)
                     if self._ptr_due is not None and self._ptr_due < now + 2:
                         self._ptr_due = now + 2  # keep pointer moves clear of key presses
                 if sent_any:
@@ -682,6 +755,7 @@ class AutomationEngine:
                 self._log("info", r.message)
                 self._detail = r.message
                 return True
+            self._last_fail_code = r.code
             self._log("warning", r.message)
             self._detail = r.message
         if r.code == "focus_changed":
@@ -689,11 +763,34 @@ class AutomationEngine:
         return False
 
     # -- pointer --------------------------------------------------------------------------
-    def _pointer_tick(self, target: RdpWindow, cfg: EngineConfig) -> None:
+    def _pointer_tick(self, target: RdpWindow, cfg: EngineConfig, background: bool = False) -> None:
         if not cfg.pointer_enabled:
             return
         with self._lock:
             state = self._ptr_state
+        if state in (PointerState.OFF, PointerState.FAULT, PointerState.SUSPENDED):
+            return
+        # The real pointer is only ever moved while it rests over the ACTIVE RDP window.  Anywhere
+        # else (RDP in the background, or your pointer elsewhere) only the remote pointer is moved.
+        posted = cfg.background_input and (background or not self.pointer.cursor_ready(target)[0])
+        if posted:
+            if state != PointerState.BACKGROUND:
+                with self._lock:
+                    if self._ptr_state != state or self._run != RunState.RUNNING:
+                        return
+                    self._set_pointer(PointerState.BACKGROUND, _POINTER_POSTED_DETAIL)
+                    self._ptr_due = self._clock() + cfg.pointer_interval_s
+                return
+            self._posted_glide(target, cfg, background)
+            return
+        if state == PointerState.BACKGROUND:  # your pointer is back over the active RDP window
+            with self._lock:
+                if self._manual_hold:
+                    self._set_pointer(PointerState.MANUAL, "You took control earlier — pointer movement over the "
+                                                           "RDP window stays paused until you resume it")
+                else:
+                    self._set_pointer(PointerState.ARMING, "Rest the mouse over the RDP window to arm")
+            return
         if state == PointerState.ARMING:
             if not self.monitor.running:
                 return  # _manage_hook reports failures
@@ -741,4 +838,22 @@ class AutomationEngine:
                 return
             self._ptr_due = self._clock() + cfg.pointer_interval_s
             self._ptr_detail = r.message
+            self._log("info" if r.ok else "warning", r.message)
+
+    def _posted_glide(self, target: RdpWindow, cfg: EngineConfig, background: bool) -> None:
+        with self._lock:
+            due = self._ptr_due
+            cancel = self._cancel
+        if due is None or self._clock() < due:
+            return
+        # RDP active but your pointer elsewhere: you may be typing into the session, so the idle guard applies.
+        outcome = self.pointer.glide_posted(target, cfg.pointer_range_px, cancel,
+                                            idle_guard_s=None if background else cfg.idle_guard_s,
+                                            foreground=not background)
+        r = outcome.result
+        with self._lock:
+            if self._ptr_state != PointerState.BACKGROUND or cancel.is_set():
+                return
+            self._ptr_due = self._clock() + cfg.pointer_interval_s
+            self._ptr_detail = r.message if r.ok else f"{r.message} — {_POINTER_POSTED_DETAIL.lower()}"
             self._log("info" if r.ok else "warning", r.message)

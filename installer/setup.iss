@@ -15,7 +15,7 @@
 #define AppName "RDP Nexus"
 #define AppExe "RDPNexus.exe"
 #define AppPublisher "RDP Nexus"
-#define AppURL ""
+#define AppURL "https://github.com/cleanstateweb-eng/RDP-Nexus"
 
 [Setup]
 AppId={{8F3C2B71-5D7A-4E8B-9C21-6A4D3E2F1B90}
@@ -23,6 +23,9 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
+AppPublisherURL={#AppURL}
+AppSupportURL={#AppURL}/issues
+AppUpdatesURL={#AppURL}/releases
 VersionInfoVersion={#AppVersion}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}

@@ -25,7 +25,7 @@ from keyboard_navigation import (
     KEY_TIMINGS, MAX_APPS, MIN_APPS, MODE_SWITCH_OPTIONS, MODES, SCROLL_DIRECTIONS, SCROLL_KEYS, SHUFFLE_APPS,
     SWITCH_SHORTCUTS,
 )
-from scheduler import AutomationEngine, DisplayState, EngineConfig, PointerState, Snapshot
+from scheduler import ACTIVE_STATES, AutomationEngine, DisplayState, EngineConfig, PointerState, Snapshot
 from settings import (
     INTERVAL_MAX, INTERVAL_MIN, MINIMIZE_TARGETS, POINTER_INTERVAL_MAX, POINTER_INTERVAL_MIN, POINTER_RANGE_MAX,
     POINTER_RANGE_MIN, SettingsStore,
@@ -56,11 +56,13 @@ C = {
 STATE_COLOR = {
     DisplayState.STOPPED: C["stopped"],
     DisplayState.RUNNING: C["running"],
+    DisplayState.BACKGROUND: C["running"],
     DisplayState.PAUSED: C["paused"],
     DisplayState.UNAVAILABLE: C["unavailable"],
 }
 POINTER_COLOR = {
     PointerState.ACTIVE: C["teal"],
+    PointerState.BACKGROUND: C["teal"],
     PointerState.ARMING: C["accent"],
     PointerState.SUSPENDED: C["paused"],
     PointerState.MANUAL: C["manual"],
@@ -396,8 +398,9 @@ class NexusPanel(ctk.CTk):
                                "'Apply Windows key combinations' is 'On the remote computer'); otherwise "
                                "Alt+Page Up is its remote Alt+Tab. RDP Nexus picks the right one before every "
                                "switch.")
-        ctk.CTkLabel(t, text="Automation only acts while this window is the active window and the session is "
-                             "visible. It never brings the window forward by itself.",
+        ctk.CTkLabel(t, text="Selecting the window is enough: it can stay in the background or minimized while "
+                             "you use other apps (Options → Background). RDP Nexus never brings it forward and "
+                             "never sends input to your local apps.",
                      font=self.f_small, text_color=C["faint"], wraplength=380, justify="left",
                      anchor="w").pack(fill="x", pady=(8, 0))
 
@@ -435,11 +438,9 @@ class NexusPanel(ctk.CTk):
                                       corner_radius=8, fg_color=C["accent"], hover_color=C["accent_hover"],
                                       text_color="#FFFFFF", command=self.test_now)
         self.btn_test.pack(side="left")
-        ctk.CTkLabel(row, text="then click into the RDP window", font=self.f_small,
-                     text_color=C["faint"]).pack(side="left", padx=(8, 0))
-        Tooltip(self.btn_test, "Runs one switch + scroll right away (no 13-minute wait): press it, click inside "
-                               "the RDP window within 15 s and keep still. The result appears in the status line "
-                               "and the Log tab.")
+        self.test_hint = ctk.CTkLabel(row, text="", font=self.f_small, text_color=C["faint"])
+        self.test_hint.pack(side="left", padx=(8, 0))
+        self.test_tip = Tooltip(self.btn_test, "")
 
         # --- Pointer ------------------------------------------------------------------
         p = tabs.add("Pointer")
@@ -463,13 +464,20 @@ class NexusPanel(ctk.CTk):
         self.ptr_state_lbl = ctk.CTkLabel(row, text="", font=self.f_small, text_color=C["muted"], anchor="w",
                                           wraplength=270, justify="left")
         self.ptr_state_lbl.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(p, text="Moves stay inside the RDP window and never click. Touching the mouse pauses "
-                             "pointer movement until you resume it.",
+        ctk.CTkLabel(p, text="Moves stay inside the RDP window and never click. Your own mouse is only moved "
+                             "while it rests over the active RDP window (touching it pauses that until you resume); "
+                             "everywhere else only the remote pointer moves.",
                      font=self.f_small, text_color=C["faint"], wraplength=380, justify="left",
                      anchor="w").pack(fill="x", pady=(8, 0))
 
         # --- Options -----------------------------------------------------------------
         o = tabs.add("Options")
+        row = self._row(o, "Background", "On: keeps the RDP session active while you use other apps, with the "
+                                         "RDP window behind them or minimized. Input is sent straight to the RDP "
+                                         "window, so your local apps, keyboard focus and mouse are never touched.\n"
+                                         "Off: automation only runs while the RDP window is the active window.")
+        self.sw_background = self._switch(row, "Keep working while I use other apps", self._on_background)
+        self.sw_background.pack(side="left")
         row = self._row(o, "Window")
         self.sw_topmost = self._switch(row, "Always on top", self._on_topmost)
         self.sw_topmost.pack(side="left")
@@ -495,7 +503,7 @@ class NexusPanel(ctk.CTk):
         ctk.CTkLabel(row, text=f"{app_info.APP_NAME} {app_info.APP_VERSION}", font=self.f_small,
                      text_color=C["text"]).pack(side="left")
         if app_info.APP_URL:
-            link = ctk.CTkLabel(row, text="Website", font=self.f_small, text_color=C["accent"], cursor="hand2")
+            link = ctk.CTkLabel(row, text="GitHub", font=self.f_small, text_color=C["accent"], cursor="hand2")
             link.pack(side="left", padx=(10, 0))
             link.bind("<Button-1>", lambda _e: webbrowser.open(app_info.APP_URL))
 
@@ -515,6 +523,8 @@ class NexusPanel(ctk.CTk):
         self.sw_keyboard.select() if s.keyboard_enabled else self.sw_keyboard.deselect()
         self.sw_pointer.select() if s.pointer_enabled else self.sw_pointer.deselect()
         self.sw_topmost.select() if s.always_on_top else self.sw_topmost.deselect()
+        self.sw_background.select() if s.background_input else self.sw_background.deselect()
+        self._update_test_hint()
         (self.sw_startup.select() if autostart.is_enabled() else self.sw_startup.deselect())
         self.seg_mode.set(MODES[s.mode])
         self._fill_switch_menu()
@@ -599,9 +609,26 @@ class NexusPanel(ctk.CTk):
     def _on_timing(self, label):
         self._apply(key_timing=next(k for k, v in KEY_TIMINGS.items() if v == label))
 
+    def _on_background(self):
+        self._apply(background_input=bool(self.sw_background.get()))
+        self._update_test_hint()
+
+    def _update_test_hint(self):
+        if self.settings.background_input:
+            self.test_hint.configure(text="RDP window can stay in the background")
+            self.test_tip.text = ("Runs one switch + scroll right away (no 13-minute wait), sent straight to the "
+                                  "RDP window. Keep the RDP window visible to watch it work. The result appears "
+                                  "in the status line and the Log tab.")
+        else:
+            self.test_hint.configure(text="then click into the RDP window")
+            self.test_tip.text = ("Runs one switch + scroll right away (no 13-minute wait): press it, click inside "
+                                  "the RDP window within 15 s and keep still. The result appears in the status "
+                                  "line and the Log tab.")
+
     def test_now(self):
         if self.engine.test_now():
-            self._flash_detail("Test: click inside the RDP window now and keep still…")
+            self._flash_detail("Test: sending to the RDP window…" if self.settings.background_input
+                               else "Test: click inside the RDP window now and keep still…")
 
     def _on_startup(self):
         want = bool(self.sw_startup.get())
@@ -655,7 +682,7 @@ class NexusPanel(ctk.CTk):
             self.refresh_targets()
 
     def start_pick(self):
-        if self.engine.snapshot().state in (DisplayState.RUNNING, DisplayState.UNAVAILABLE):
+        if self.engine.snapshot().state in ACTIVE_STATES:
             self._flash_detail("Pause or stop automation before changing the RDP window")
             return
         self._pick_deadline = time.monotonic() + 8.0
@@ -688,7 +715,7 @@ class NexusPanel(ctk.CTk):
     # ----------------------------------------------------------------- commands
     def play_pause(self):
         state = self.engine.snapshot().state
-        if state in (DisplayState.RUNNING, DisplayState.UNAVAILABLE):
+        if state in ACTIVE_STATES:
             self.engine.pause()
         elif state == DisplayState.PAUSED:
             self.engine.resume()
@@ -833,7 +860,7 @@ class NexusPanel(ctk.CTk):
             self._set(self.count_lbl, text=fmt_countdown(snap.countdown_s),
                       text_color=C["text"] if snap.countdown_s is not None else C["faint"])
 
-        running = snap.state in (DisplayState.RUNNING, DisplayState.UNAVAILABLE)
+        running = snap.state in ACTIVE_STATES
         if running:
             self._set(self.btn_play, text=self.glyph("pause"))
             self.btn_play.tooltip.text = "Pause"
@@ -856,7 +883,7 @@ class NexusPanel(ctk.CTk):
         chip, chip_tip, clickable = "", "", False
         if snap.pointer_enabled and snap.state != DisplayState.STOPPED:
             ps = snap.pointer_state
-            if ps == PointerState.ACTIVE and snap.pointer_countdown_s is not None:
+            if ps in (PointerState.ACTIVE, PointerState.BACKGROUND) and snap.pointer_countdown_s is not None:
                 chip = f"Pointer · {int(snap.pointer_countdown_s)} s"
             elif ps in (PointerState.MANUAL, PointerState.FAULT):
                 chip, clickable = "Resume pointer", True
@@ -890,7 +917,7 @@ class NexusPanel(ctk.CTk):
                 kind = f"{snap.target.kind} · " if snap.target else ""
                 self._set(self.conn_lbl, text=f"{kind}{st.message}")
         self._set(self.keys_lbl, text=snap.switch_note.replace("App switching: ", "") or "—")
-        locked = snap.state in (DisplayState.RUNNING, DisplayState.UNAVAILABLE)
+        locked = snap.state in ACTIVE_STATES
         for widget in (self.target_menu, self.btn_refresh, self.btn_pick):
             self._set(widget, state="disabled" if locked else "normal")
 

@@ -101,6 +101,8 @@ HIDDEN = "hidden"
 DIALOG = "dialog"
 DISCONNECTED = "disconnected"
 NOT_FOREGROUND = "not_foreground"
+# Valid and usable, but not the active window: background mode sends input to it directly.
+BACKGROUND = "background"
 
 _STATUS_TEXT = {
     OK: "Connected and in the foreground",
@@ -113,11 +115,13 @@ _STATUS_TEXT = {
     DIALOG: "RDP client is showing a dialog (session may be disconnected)",
     DISCONNECTED: "RDP session appears disconnected",
     NOT_FOREGROUND: "RDP window is not the active window",
+    BACKGROUND: "Connected · in the background (input goes straight to the RDP window)",
 }
+_USABLE = frozenset({OK, BACKGROUND})
 
 
 def status(code: str, detail: str | None = None) -> TargetStatus:
-    return TargetStatus(code == OK, code, detail or _STATUS_TEXT[code])
+    return TargetStatus(code in _USABLE, code, detail or _STATUS_TEXT[code])
 
 
 class WindowInspector:
@@ -283,8 +287,13 @@ class WindowInspector:
         return result
 
     # -- validation ----------------------------------------------------------------
-    def check(self, target: RdpWindow | None, require_foreground: bool = True) -> TargetStatus:
-        """Validate the target.  Order matters: the cheapest decisive checks run first."""
+    def check(self, target: RdpWindow | None, require_foreground: bool = True,
+              allow_background: bool = False) -> TargetStatus:
+        """Validate the target.  Order matters: the cheapest decisive checks run first.
+
+        `allow_background` accepts a window that is minimized or on another virtual desktop
+        (background mode posts input to it instead of needing it on screen and active).
+        """
         if target is None:
             return status(NO_TARGET)
         hwnd = target.hwnd
@@ -294,9 +303,9 @@ class WindowInspector:
             return status(REPLACED)
         if w.IsHungAppWindow(hwnd):
             return status(HUNG)
-        if w.IsIconic(hwnd):
+        if not allow_background and w.IsIconic(hwnd):
             return status(MINIMIZED)
-        if not w.IsWindowVisible(hwnd) or self.is_cloaked(hwnd):
+        if not w.IsWindowVisible(hwnd) or (not allow_background and self.is_cloaked(hwnd)):
             return status(HIDDEN)
         if not w.IsWindowEnabled(hwnd) or self.owned_dialog_visible(hwnd, target.pid):
             return status(DIALOG)
@@ -326,6 +335,29 @@ class WindowInspector:
     def is_foreground(self, target: RdpWindow) -> bool:
         """Cheapest possible last-moment check, used right before SendInput."""
         return self.foreground_root() == target.hwnd
+
+    def input_window(self, target: RdpWindow) -> int:
+        """The window that receives the session's keyboard/mouse input (0 if it is gone)."""
+        if target.has_input_child:
+            return self.find_child(target.hwnd, INPUT_CHILD_CLASS)
+        return target.hwnd if w.IsWindow(target.hwnd) else 0
+
+    def input_client_size(self, target: RdpWindow) -> tuple[int, int, int] | None:
+        """(input window, width, height) in that window's own client coordinates, or None."""
+        hwnd = self.input_window(target)
+        if not hwnd:
+            return None
+        r = wintypes.RECT()
+        if not w.GetClientRect(hwnd, ctypes.byref(r)) or r.right <= 0 or r.bottom <= 0:
+            return None
+        return hwnd, int(r.right), int(r.bottom)
+
+    @staticmethod
+    def client_to_screen(hwnd: int, x: int, y: int) -> tuple[int, int] | None:
+        pt = wintypes.POINT(x, y)
+        if not w.ClientToScreen(hwnd, ctypes.byref(pt)):
+            return None
+        return pt.x, pt.y
 
     def input_area(self, target: RdpWindow) -> Rect | None:
         """Screen rectangle (physical pixels) that shows the remote session.

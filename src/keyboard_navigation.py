@@ -1,13 +1,19 @@
 """Keyboard navigation: a curated allow-list of shortcuts, the app shuffler, and
 the code that sends one chord through the safety gate.
 
-Only the shortcuts defined here can ever be sent.  None of them is a local
-Windows shell shortcut (no Win key, no Alt+Tab, no Ctrl+Alt+Del, no Alt+F4),
-so even a mis-routed chord cannot switch, close or lock local applications.
+Only the keys defined here can ever be sent: no Win key, no Esc/Delete/F-keys
+or letters, so nothing can lock, close or type into anything.  The static
+shortcuts never include Alt+Tab.  Alt+Tab / Alt+Shift+Tab are sent only to an
+RDP window that is in front AND whose client is set to pass Windows key
+combinations to the remote PC (see rdp_settings.py); if that setting is ever
+misread, one Alt+Tab can reach this computer, which the engine detects and then
+never uses Alt+Tab for that window again.
 
-Keys are sent as hardware scan codes (KEYEVENTF_SCANCODE), which is what the
-Remote Desktop client forwards to the remote session, one event at a time with
-human-like timing (see Pacing).
+While the RDP window is the active window, keys are sent as hardware scan codes
+(SendInput, KEYEVENTF_SCANCODE), which is what the Remote Desktop client
+forwards to the remote session, one event at a time with human-like timing
+(see Pacing).  In background mode the same paced events are posted as window
+messages to the RDP window itself (see background_input.py).
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import time
 from dataclasses import dataclass
 
 import winapi as w
+from background_input import key_lparam, key_message
 from input_safety import INJECTION_SIGNATURE, InjectionLedger, SafetyGate
 from window_detection import RdpWindow
 
@@ -26,17 +33,18 @@ class Key:
     name: str
     scan: int
     extended: bool = False
+    vk: int = 0  # virtual-key code, used only for posted (background) messages
 
 
 KEYS = {
-    "ctrl": Key("Ctrl", 0x1D),
-    "shift": Key("Shift", 0x2A),
-    "alt": Key("Alt", 0x38),
-    "tab": Key("Tab", 0x0F),
-    "pageup": Key("Page Up", 0x49, True),
-    "pagedown": Key("Page Down", 0x51, True),
-    "up": Key("Up", 0x48, True),
-    "down": Key("Down", 0x50, True),
+    "ctrl": Key("Ctrl", 0x1D, vk=0x11),
+    "shift": Key("Shift", 0x2A, vk=0x10),
+    "alt": Key("Alt", 0x38, vk=0x12),
+    "tab": Key("Tab", 0x0F, vk=0x09),
+    "pageup": Key("Page Up", 0x49, True, vk=0x21),
+    "pagedown": Key("Page Down", 0x51, True, vk=0x22),
+    "up": Key("Up", 0x48, True, vk=0x26),
+    "down": Key("Down", 0x50, True, vk=0x28),
 }
 MODIFIERS = ("ctrl", "shift", "alt")
 
@@ -289,10 +297,11 @@ class KeyboardNavigator:
     """
 
     def __init__(self, gate: SafetyGate, ledger: InjectionLedger, send=w.send_inputs, sleep=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, post=w.post_message):
         self.gate = gate
         self.ledger = ledger
         self._send = send
+        self._post = post
         self._sleep = sleep
         self._clock = clock
 
@@ -328,7 +337,9 @@ class KeyboardNavigator:
             held.clear()
 
     def send_chord(self, target: RdpWindow, keys: tuple[str, ...], idle_guard_s: float, repeat: int = 1,
-                   pacing: Pacing = PACING["normal"], cancel=None) -> ActionResult:
+                   pacing: Pacing = PACING["normal"], cancel=None, background: bool = False) -> ActionResult:
+        if background:
+            return self._post_chord(target, keys, repeat, pacing, cancel)
         text = chord_text(keys, repeat)
         verdict = self.gate.check_keyboard(target, idle_guard_s)
         if not verdict.ok:
@@ -359,3 +370,51 @@ class KeyboardNavigator:
             return ActionResult(False, "focus_changed",
                                 f"Focus left the RDP window right after {text}; automation suspended")
         return ActionResult(True, "ok", f"Sent {text} over {self._clock() - started:.2f} s")
+
+    # -- background mode: post the same paced events to the RDP window only ---------------
+    def _post_key(self, hwnd: int, event: KeyEvent, held: list[str]) -> bool:
+        key = KEYS[event.key]
+        # Windows marks key messages sent while Alt is held as WM_SYSKEY* (bit 29 set); the
+        # release of Alt itself, after another key, arrives as a plain WM_KEYUP.
+        alt = (event.key == "alt" and event.down) or ("alt" in held and event.key != "alt")
+        return self._post(hwnd, key_message(event.down, alt), key.vk,
+                          key_lparam(key.scan, key.extended, event.down, alt))
+
+    def _release_posted(self, hwnd: int, held: list[str]) -> None:
+        for k in reversed(list(held)):
+            held.remove(k)
+            self._post_key(hwnd, KeyEvent(k, False), held)
+
+    def _post_chord(self, target: RdpWindow, keys: tuple[str, ...], repeat: int, pacing: Pacing,
+                    cancel) -> ActionResult:
+        text = chord_text(keys, repeat)
+        verdict = self.gate.check_background(target)
+        if not verdict.ok:
+            return ActionResult(False, verdict.code, f"Skipped {text}: {verdict.message}")
+        hwnd = self.gate.inspector.input_window(target)
+        if not hwnd:
+            return ActionResult(False, "disconnected", f"Skipped {text}: the RDP input window is not available")
+        held: list[str] = []
+        started = self._clock()
+        try:
+            for step in paced_steps(keys, repeat, pacing):
+                if cancel is not None and cancel.is_set():
+                    self._release_posted(hwnd, held)
+                    return ActionResult(False, "cancelled", f"{text} interrupted: automation was paused or "
+                                                            "stopped; keys released")
+                v = self.gate.check_background(target)
+                if not v.ok:
+                    self._release_posted(hwnd, held)
+                    return ActionResult(False, v.code, f"{text} interrupted: {v.message}; keys released")
+                if not self._post_key(hwnd, step.event, held):
+                    self._release_posted(hwnd, held)
+                    return ActionResult(False, "send_failed", f"{text} could not be delivered to the RDP window")
+                if step.event.down:
+                    held.append(step.event.key)
+                elif step.event.key in held:
+                    held.remove(step.event.key)
+                self._wait(step.delay_ms / 1000.0, cancel)
+        finally:
+            self._release_posted(hwnd, held)  # never leave a key pressed in the remote session
+        return ActionResult(True, "ok", f"Sent {text} to the RDP window in the background "
+                                        f"over {self._clock() - started:.2f} s")
