@@ -329,6 +329,16 @@ class NexusPanel(ctk.CTk):
         self.details = ctk.CTkFrame(outer, fg_color="transparent")
         self._build_details(self.details)
 
+    def _tab(self, tabs, name):
+        """A settings tab whose content scrolls (mouse wheel or the thin scrollbar) when it is taller
+        than the panel, so no setting is ever cut off."""
+        page = ctk.CTkScrollableFrame(tabs.add(name), fg_color="transparent", corner_radius=0,
+                                      scrollbar_fg_color="transparent", scrollbar_button_color=C["border"],
+                                      scrollbar_button_hover_color=C["hover"])
+        page.pack(fill="both", expand=True)
+        self.__dict__.setdefault("tab_pages", {})[name] = page
+        return page
+
     def _row(self, master, label, tip=None):
         row = ctk.CTkFrame(master, fg_color="transparent")
         row.pack(fill="x", pady=4)
@@ -359,7 +369,7 @@ class NexusPanel(ctk.CTk):
                              fg_color=C["border"], switch_width=36, switch_height=18)
 
     def _build_details(self, root):
-        tabs = ctk.CTkTabview(root, height=290, fg_color=C["surface"], corner_radius=12,
+        tabs = ctk.CTkTabview(root, height=372, fg_color=C["surface"], corner_radius=12,
                               segmented_button_fg_color=C["surface2"],
                               segmented_button_selected_color=C["accent"],
                               segmented_button_selected_hover_color=C["accent_hover"],
@@ -371,7 +381,7 @@ class NexusPanel(ctk.CTk):
         self.tabs = tabs
 
         # --- Target ---------------------------------------------------------------
-        t = tabs.add("Target")
+        t = self._tab(tabs, "Target")
         row = self._row(t, "RDP window", "Choose the Remote Desktop window to automate. Only mstsc/msrdc "
                                           "session windows are accepted.")
         self.target_menu = self._option(row, [PLACEHOLDER], self._on_target_chosen, width=200)
@@ -406,7 +416,7 @@ class NexusPanel(ctk.CTk):
                      anchor="w").pack(fill="x", pady=(8, 0))
 
         # --- Keys -------------------------------------------------------------------
-        k = tabs.add("Keys")
+        k = self._tab(tabs, "Keys")
         row = self._row(k, "Keyboard")
         self.sw_keyboard = self._switch(row, "Periodic navigation", self._on_keyboard_switch)
         self.sw_keyboard.pack(side="left")
@@ -444,7 +454,7 @@ class NexusPanel(ctk.CTk):
         self.test_tip = Tooltip(self.btn_test, "")
 
         # --- Pointer ------------------------------------------------------------------
-        p = tabs.add("Pointer")
+        p = self._tab(tabs, "Pointer")
         row = self._row(p, "Pointer")
         self.sw_pointer = self._switch(row, "Gentle movement", self._on_pointer_switch)
         self.sw_pointer.pack(side="left")
@@ -472,7 +482,7 @@ class NexusPanel(ctk.CTk):
                      anchor="w").pack(fill="x", pady=(8, 0))
 
         # --- Options -----------------------------------------------------------------
-        o = tabs.add("Options")
+        o = self._tab(tabs, "Options")
         row = self._row(o, "Background", "On: keeps the RDP session active while you use other apps, with the "
                                          "RDP window behind them or minimized. When an app switch is due and you "
                                          "pause for 3 s (no typing or mouse use), the RDP window comes forward "
@@ -509,6 +519,9 @@ class NexusPanel(ctk.CTk):
             link = ctk.CTkLabel(row, text="GitHub", font=self.f_small, text_color=C["accent"], cursor="hand2")
             link.pack(side="left", padx=(10, 0))
             link.bind("<Button-1>", lambda _e: webbrowser.open(app_info.APP_URL))
+
+        for page in self.tab_pages.values():  # breathing room so the last row is never cut off
+            ctk.CTkFrame(page, height=14, fg_color="transparent").pack(fill="x")
 
         # --- Log ------------------------------------------------------------------------
         g = tabs.add("Log")

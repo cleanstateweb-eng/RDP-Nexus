@@ -179,7 +179,7 @@ from a fresh copy: it only packages the program that `build_windows.bat` builds 
 
 ### Publishing a release
 1. Bump `APP_VERSION` in `src/app_info.py` and add `docs/releases/v<version>.md`.
-2. Commit, then tag and push: `git tag v1.0.7` and `git push origin v1.0.7`.
+2. Commit, then tag and push: `git tag v1.0.8` and `git push origin v1.0.8`.
 3. GitHub Actions (*Build and release*) tests and builds everything on GitHub's own Windows machine,
    checks the tag matches `APP_VERSION`, and publishes the Release with the installer, the portable exe,
    `SHA256SUMS.txt` and `RDPNexus-setup.exe` (the file behind the one-click download link).
