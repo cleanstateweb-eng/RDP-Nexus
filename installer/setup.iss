@@ -1,10 +1,12 @@
 ; Inno Setup 6 script for RDP Nexus.
-; Built by scripts\build.py, which passes /DAppVersion, /DSourceDir and /DOutputDir.
+;
+; THIS FILE IS NOT THE INSTALLER.  To install RDP Nexus, download RDPNexus-setup.exe from
+; https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest and double-click it.
+;
+; It packages an already-built program.  scripts\build_windows.bat builds the program and then
+; compiles this script (passing /DAppVersion, /DSourceDir and /DOutputDir).
 ; Per-user install (no administrator rights): {autopf} resolves to %LOCALAPPDATA%\Programs.
 
-#ifndef AppVersion
-  #define AppVersion "1.0.0"
-#endif
 #ifndef SourceDir
   #define SourceDir "..\dist\RDPNexus"
 #endif
@@ -16,6 +18,17 @@
 #define AppExe "RDPNexus.exe"
 #define AppPublisher "RDP Nexus"
 #define AppURL "https://github.com/cleanstateweb-eng/RDP-Nexus"
+
+; Opened straight from a downloaded copy of the source?  Then there is nothing to package yet.
+#define SourceProbe (Pos(":", SourceDir) > 0 ? SourceDir : AddBackslash(SourcePath) + SourceDir)
+#if !FileExists(AddBackslash(SourceProbe) + AppExe)
+  #error RDP Nexus has not been built yet, so there is nothing to package. To INSTALL it, download RDPNexus-setup.exe from https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest and double-click it. To BUILD it yourself, run scripts\build_windows.bat instead of opening this file.
+#endif
+#ifndef AppVersion
+  ; Compiled by hand: take the version from the built program (1.0.5.0 -> 1.0.5).
+  #define ExeVersion GetVersionNumbersString(AddBackslash(SourceProbe) + AppExe)
+  #define AppVersion Copy(ExeVersion, 1, RPos(".", ExeVersion) - 1)
+#endif
 
 [Setup]
 AppId={{8F3C2B71-5D7A-4E8B-9C21-6A4D3E2F1B90}

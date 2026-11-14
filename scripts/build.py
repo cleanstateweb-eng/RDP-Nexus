@@ -8,6 +8,7 @@
 Outputs (all in ./release):
     RDPNexus-<version>-setup.exe      Inno Setup installer (per-user, no admin rights)
     RDPNexus-<version>-portable.exe   single-file portable executable
+    RDPNexus-setup.exe                the same installer under a fixed name (one-click "latest" link)
     SHA256SUMS.txt                    checksums of the files above
 """
 
@@ -139,7 +140,11 @@ def main() -> int:
             raise SystemExit("Inno Setup (ISCC.exe) not found. Install Inno Setup 6, set ISCC=<path>, "
                              "or pass --no-installer.")
         run([iscc, "/Q", f"/DAppVersion={version}", f"/DSourceDir={onedir}", f"/DOutputDir={RELEASE}", ISS])
-        artifacts.append(os.path.join(RELEASE, f"RDPNexus-{version}-setup.exe"))
+        setup = os.path.join(RELEASE, f"RDPNexus-{version}-setup.exe")
+        artifacts.append(setup)
+        # The same installer under a fixed name, so the README's one-click link
+        # .../releases/latest/download/RDPNexus-setup.exe always downloads the newest version.
+        artifacts.append(shutil.copy2(setup, os.path.join(RELEASE, "RDPNexus-setup.exe")))
 
     with open(os.path.join(RELEASE, "SHA256SUMS.txt"), "w", encoding="utf-8", newline="\n") as fh:
         for path in artifacts:

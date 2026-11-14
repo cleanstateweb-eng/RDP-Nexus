@@ -9,7 +9,12 @@ working while you use other apps: the RDP window can stay behind other windows o
 and you don't have to keep your mouse over it. Input is sent straight to the RDP window, so your
 local apps, keyboard focus and mouse pointer are never touched.
 
-Source: <https://github.com/cleanstateweb-eng/RDP-Nexus>
+## ⬇️ [Download RDP Nexus for Windows](https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest/download/RDPNexus-setup.exe)
+
+One click downloads the latest installer (`RDPNexus-setup.exe`); double-click it to install.
+Windows 10/11 · no admin rights · nothing else to install. All versions: [Releases](https://github.com/cleanstateweb-eng/RDP-Nexus/releases).
+
+> Don't use GitHub's green **Code → Download ZIP** button to install: that is the source code, not the app.
 
 ---
 
@@ -19,7 +24,7 @@ Source: <https://github.com/cleanstateweb-eng/RDP-Nexus>
 All dependencies, libraries, and Python runtimes are completely built into the application package. You do **not** need to install Python, run any commands, or configure any settings.
 
 ### Option 1: Standard Installer (Recommended — 1-Click Setup)
-1. Download **`RDPNexus-1.0.5-setup.exe`** from the [Releases](https://github.com/cleanstateweb-eng/RDP-Nexus/releases) page.
+1. Click **[Download RDPNexus-setup.exe](https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest/download/RDPNexus-setup.exe)** (always the latest version).
 2. **Double-click** the downloaded setup file.
 3. If a blue Windows SmartScreen popup appears (*"Windows protected your PC"*):
    - Click **More info**
@@ -30,7 +35,7 @@ All dependencies, libraries, and Python runtimes are completely built into the a
 ---
 
 ### Option 2: Portable Version (Zero Installation)
-- Download **`RDPNexus-1.0.5-portable.exe`**.
+- Download **`RDPNexus-<version>-portable.exe`** from the latest [Release](https://github.com/cleanstateweb-eng/RDP-Nexus/releases/latest).
 - Simply double-click the file to open and use RDP Nexus immediately.
 - Nothing gets installed; you can even run it directly from a USB flash drive.
 
@@ -168,7 +173,15 @@ Build the standalone package and installer (runs the tests first):
 ```bat
 scripts\build_windows.bat
 ```
-The output files will be created in the `release/` folder.
+The output files will be created in the `release/` folder. Don't compile `installer\setup.iss` by hand
+from a fresh copy: it only packages the program that `build_windows.bat` builds first.
+
+### Publishing a release
+1. Bump `APP_VERSION` in `src/app_info.py` and add `docs/releases/v<version>.md`.
+2. Commit, then tag and push: `git tag v1.0.6` and `git push origin v1.0.6`.
+3. GitHub Actions (*Build and release*) tests and builds everything on GitHub's own Windows machine,
+   checks the tag matches `APP_VERSION`, and publishes the Release with the installer, the portable exe,
+   `SHA256SUMS.txt` and `RDPNexus-setup.exe` (the file behind the one-click download link).
 
 ---
 
