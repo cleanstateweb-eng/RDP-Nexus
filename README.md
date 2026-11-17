@@ -30,6 +30,12 @@ All dependencies, libraries, and Python runtimes are completely built into the a
    administrator rights needed), adds **Desktop** and **Start Menu** shortcuts, and starts RDP Nexus.
    An older version that is running is closed and replaced automatically; your settings are kept.
 
+> **Always the newest version:** any RDP Nexus installer — even an old one you downloaded months ago —
+> checks GitHub for the newest release while it installs. If there is a newer one, it downloads it,
+> verifies its checksum and installs that instead (the progress bar shows the download). It never
+> downgrades: if a newer version is already installed, it changes nothing. Offline, you get the
+> version the installer contains.
+
 > **Only the first time:** because the app is new and not code-signed, your browser may ask you to **Keep**
 > the file, and Windows may show *"Windows protected your PC"*: click **More info → Run anyway**. These
 > warnings come from the browser and Windows, not from RDP Nexus, and can't be switched off by the app.
@@ -179,7 +185,7 @@ from a fresh copy: it only packages the program that `build_windows.bat` builds 
 
 ### Publishing a release
 1. Bump `APP_VERSION` in `src/app_info.py` and add `docs/releases/v<version>.md`.
-2. Commit, then tag and push: `git tag v1.0.9` and `git push origin v1.0.9`.
+2. Commit, then tag and push: `git tag v1.0.10` and `git push origin v1.0.10`.
 3. GitHub Actions (*Build and release*) tests and builds everything on GitHub's own Windows machine,
    checks the tag matches `APP_VERSION`, and publishes the Release with the installer, the portable exe,
    `SHA256SUMS.txt` and `RDPNexus-setup.exe` (the file behind the one-click download link).
